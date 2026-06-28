@@ -47,8 +47,10 @@ JURISDICTION_DEFAULT = 0.6  # unknown → weakest known enforceability
 HISTORY_CREDIT_FACTOR = 0.5   # verified API history credited at half
 HISTORY_CREDIT_CAP = 6.0      # max months of credit from history
 BASE_MONTHS_ENTRY = 2.0       # Effective_Tenure < 6
-BASE_MONTHS_MID = 3.0         # 6 ≤ Effective_Tenure (computed ceiling; 4.0 needs override)
+BASE_MONTHS_MID = 3.0         # 6 ≤ Effective_Tenure < 13
+BASE_MONTHS_HIGH = 4.0        # Effective_Tenure ≥ 13 (earned by routing tenure)
 TENURE_MID_THRESHOLD = 6.0
+TENURE_HIGH_THRESHOLD = 13.0  # above 4.0 requires base_months_override (committee review)
 
 # ── Merchant_Score (PBS / rating, 1–10 → factor) ──────────────────────────────────────────
 MERCHANT_SCORE_DEFAULT = 0.8  # null component defaults to mid tier

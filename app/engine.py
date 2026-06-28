@@ -174,12 +174,21 @@ def _jurisdiction(country: str | None) -> float:
 
 
 def _base_months(routing_months: int, verified_api_months: int, override: float | None) -> tuple[float, float, bool]:
-    """Returns (base_months, effective_tenure, override_used)."""
+    """Returns (base_months, effective_tenure, override_used).
+
+    2.0 / 3.0 / 4.0 are all earned by Effective_Tenure (routing months + half verified history,
+    capped at 6 months of credit). The override is reserved for above 4.0 — committee review.
+    """
     credit = min(C.HISTORY_CREDIT_FACTOR * verified_api_months, C.HISTORY_CREDIT_CAP)
     effective_tenure = routing_months + credit
     if override is not None:
         return float(override), effective_tenure, True
-    base = C.BASE_MONTHS_ENTRY if effective_tenure < C.TENURE_MID_THRESHOLD else C.BASE_MONTHS_MID
+    if effective_tenure < C.TENURE_MID_THRESHOLD:
+        base = C.BASE_MONTHS_ENTRY
+    elif effective_tenure < C.TENURE_HIGH_THRESHOLD:
+        base = C.BASE_MONTHS_MID
+    else:
+        base = C.BASE_MONTHS_HIGH
     return base, effective_tenure, False
 
 

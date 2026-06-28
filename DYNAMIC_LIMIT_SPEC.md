@@ -143,12 +143,14 @@ Effective_Tenure = routing_months + min(0.5 × verified_api_history_months, 6)
 |---|---|---|
 | 0 – 5 | 2.0 | rating within appetite |
 | 6 – 12 | 3.0 | no hard-freeze triggers |
-| ≥ 13 | 4.0 | requires `base_months_override` (behaviour gate / committee) |
+| ≥ 13 | 4.0 | earned by tenure — no override needed |
+| above 4.0 | `base_months_override` | committee individual review only |
 
 `verified_api_history_months` is **derived** from `payouts_history` (count of distinct
 months, longest currency stream). The credit caps at 6, so any merchant with ≥12 months of
 history lands at Effective_Tenure 6 → **Base_Months 3.0** at onboarding (`routing_months = 0`).
-**4.0 is unreachable by computation alone** — it requires `base_months_override`.
+**4.0 is earned by routing tenure** — reaching Effective_Tenure ≥ 13 needs `routing_months ≥ 7`
+(history credit alone tops out at 6). The override is reserved for limits *above* 4.0.
 
 ### 4.6 Merchant_Score components (1–10 raw → factor)
 

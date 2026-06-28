@@ -69,7 +69,8 @@ def test_jurisdiction(country, expected):
 
 
 # ── Base months ──────────────────────────────────────────────────────────────────────────────
-def test_base_months_pre_launch_caps_at_3():
+def test_base_months_pre_launch_is_3():
+    # onboarding: routing 0, full history credit (capped at 6) → ET 6 → 3.0
     base, et, override = _base_months(routing_months=0, verified_api_months=24, override=None)
     assert et == 6.0            # 0 + min(0.5*24, 6)
     assert base == 3.0
@@ -82,9 +83,17 @@ def test_base_months_thin_history():
     assert base == 2.0
 
 
-def test_base_months_override():
-    base, _, used = _base_months(routing_months=0, verified_api_months=24, override=4.0)
-    assert base == 4.0 and used is True
+def test_base_months_four_earned_by_tenure():
+    # 7 routed months + 6 history credit → ET 13 → 4.0, no override needed
+    base, et, used = _base_months(routing_months=7, verified_api_months=24, override=None)
+    assert et == 13.0
+    assert base == 4.0
+    assert used is False
+
+
+def test_base_months_override_only_above_four():
+    base, _, used = _base_months(routing_months=20, verified_api_months=24, override=5.0)
+    assert base == 5.0 and used is True
 
 
 # ── Seasonal index (synthetic data) ─────────────────────────────────────────────────────────────
