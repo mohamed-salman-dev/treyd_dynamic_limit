@@ -55,7 +55,8 @@ construction — the coverage ceiling is structural, with no separate hard cap.
 | This service owns | The calling service owns |
 |---|---|
 | Trailing_Flow (weighted 3-month) | Filtering payouts to Treyd-routed only |
-| Expected_Flow curve + seasonal index | Splitting payouts by settlement currency |
+| Expected_Flow curve + seasonal index | Tagging each payout with its settlement currency |
+| Splitting channels into per-currency streams | — |
 | Seasonal floor + floor guard | Aggregating raw payouts to monthly totals |
 | Legal-security norm from instruments | Fetching FX rates (e.g. Google Sheet) → `fx_rates` |
 | Quality `Q` per channel | Prior displayed limit + glide computation |
@@ -175,17 +176,20 @@ zeroes the limit.
 ```python
 class MonthlyAmount(BaseModel):
     month:      str            # "YYYY-MM"
-    amount:     float          # positive, in the channel's declared currency
+    amount:     float          # positive, in this entry's currency
+    currency:   str            # ISO-4217 of this settlement — the service splits streams by it
     encumbered: bool = False   # on routed entries: True = repays financed receivables (excluded
                                #   from free flow). Defaults False → all free until flagged.
 
 class ChannelInput(BaseModel):
     channel_id:           str
-    channel_type:         str                       # registry key
-    currency:             str
-    payouts_history:      list[MonthlyAmount]        # all SP settlements — flow curve + tenure
-    treyd_routed_payouts: list[MonthlyAmount] = []   # actual Treyd-routed — Trailing, capture, RC
-    routing_confirmed:    bool | None         = None # None → derive; fallback 0.75
+    channel_type:         str                       # registry key (integration, e.g. shopify_payments)
+    payouts_history:      list[MonthlyAmount]        # all settlements, any currency — flow curve + tenure
+    treyd_routed_payouts: list[MonthlyAmount] = []   # Treyd-routed, any currency — Trailing, capture, RC
+    routing_confirmed:    bool | None         = None # None → derive per currency; fallback 0.75
+    # Currency lives on each MonthlyAmount. A channel = one integration; the service splits its
+    # payouts into one stream per settlement currency (so a Shopify Markets store with 5 currencies
+    # is ONE ChannelInput → 5 streams → 5 limits).
 
 class MerchantLimitRequest(BaseModel):
     merchant_id:   str

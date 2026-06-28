@@ -15,6 +15,7 @@ from app.engine import (
     _map_pbs,
     _map_rating,
     _seasonal_index,
+    _streams,
     compute_limit,
 )
 from app.models import ChannelInput
@@ -54,7 +55,7 @@ def test_map_rating(rating, expected):
 
 
 def test_below_appetite_zeroes_limit():
-    chans = [ChannelInput(channel_id="c", channel_type="shopify_payments", currency="GBP",
+    chans = [ChannelInput(channel_id="c", channel_type="shopify_payments",
                           payouts_history=flat_history(month_range("2025-01", 13), 50_000))]
     resp = compute_limit(make_request(chans, rating_score=2), month("2026-01"), "t")
     assert resp.merchant_trace.merchant_score == 0.0
@@ -105,7 +106,7 @@ def test_thin_history_has_no_seasonal():
 # ── Flow base / seasonal floor (synthetic data) ──────────────────────────────────────────────────
 def test_floor_binds_entering_peak():
     hist = seasonal_history("2024-01", 21, base=40_000)  # ends 2025-09
-    chans = [ChannelInput(channel_id="shopify", channel_type="shopify_payments", currency="GBP", payouts_history=hist)]
+    chans = [ChannelInput(channel_id="shopify", channel_type="shopify_payments", payouts_history=hist)]
     resp = compute_limit(make_request(chans, country="gb"), month("2025-09"), "t")
     ch = resp.limits["GBP"].channels[0]
     assert ch.seasonal_floor_active is True
@@ -114,7 +115,7 @@ def test_floor_binds_entering_peak():
 
 def test_trailing_wins_post_peak():
     hist = seasonal_history("2024-01", 24, base=40_000)  # ends 2025-12 (peak just passed)
-    chans = [ChannelInput(channel_id="shopify", channel_type="shopify_payments", currency="GBP", payouts_history=hist)]
+    chans = [ChannelInput(channel_id="shopify", channel_type="shopify_payments", payouts_history=hist)]
     resp = compute_limit(make_request(chans, country="gb"), month("2025-12"), "t")
     ch = resp.limits["GBP"].channels[0]
     assert ch.seasonal_floor_active is False
@@ -125,8 +126,8 @@ def test_no_lookahead_truncation():
     """A past as_of must ignore later months: the limit is unchanged by adding later data."""
     hist = seasonal_history("2024-01", 24, base=40_000)
     early = [a for a in hist if a.month <= month("2025-09")]
-    chans_full = [ChannelInput(channel_id="s", channel_type="shopify_payments", currency="GBP", payouts_history=hist)]
-    chans_early = [ChannelInput(channel_id="s", channel_type="shopify_payments", currency="GBP", payouts_history=early)]
+    chans_full = [ChannelInput(channel_id="s", channel_type="shopify_payments", payouts_history=hist)]
+    chans_early = [ChannelInput(channel_id="s", channel_type="shopify_payments", payouts_history=early)]
     a = compute_limit(make_request(chans_full, country="gb"), month("2025-09"), "t")
     b = compute_limit(make_request(chans_early, country="gb"), month("2025-09"), "t")
     assert a.limits["GBP"].dynamic_limit == b.limits["GBP"].dynamic_limit
@@ -134,29 +135,29 @@ def test_no_lookahead_truncation():
 
 # ── Capture ───────────────────────────────────────────────────────────────────────────────────
 def test_capture_floors_at_half_with_no_routed_flow():
-    chans = [ChannelInput(channel_id="s", channel_type="shopify_payments", currency="GBP",
+    chans = [ChannelInput(channel_id="s", channel_type="shopify_payments",
                           payouts_history=flat_history(month_range("2025-01", 13), 70_000))]
     req = make_request(chans, total_revenue_ltm=1_200_000)
-    _, score, routed = _capture_score(req, month("2026-01"))
+    _, score, routed = _capture_score(_streams(req), req, month("2026-01"))
     assert routed == 0.0 and score == 0.5
 
 
 def test_capture_with_routed_flow():
     months = month_range("2025-02", 12)
-    chans = [ChannelInput(channel_id="s", channel_type="shopify_payments", currency="GBP",
+    chans = [ChannelInput(channel_id="s", channel_type="shopify_payments",
                           treyd_routed_payouts=flat_history(months, 70_000))]
     req = make_request(chans, total_revenue_ltm=1_200_000)  # 70k*12 = 840k routed / 1.2m = 0.7
-    capture, score, _ = _capture_score(req, month("2026-01"))
+    capture, score, _ = _capture_score(_streams(req), req, month("2026-01"))
     assert capture == pytest.approx(0.7, abs=0.01)
     assert score == pytest.approx(0.82, abs=0.01)           # 0.7 / 0.85
 
 
 def test_capture_fx_normalizes_to_revenue_currency():
     months = month_range("2025-02", 12)
-    chans = [ChannelInput(channel_id="s", channel_type="shopify_payments", currency="SEK",
-                          treyd_routed_payouts=flat_history(months, 700_000))]
+    chans = [ChannelInput(channel_id="s", channel_type="shopify_payments",
+                          treyd_routed_payouts=flat_history(months, 700_000, currency="SEK"))]
     req = make_request(chans, revenue_currency="GBP", total_revenue_ltm=1_000_000, fx_rates={"SEK": 0.075})
-    _, _, routed = _capture_score(req, month("2026-01"))
+    _, _, routed = _capture_score(_streams(req), req, month("2026-01"))
     assert routed == pytest.approx(700_000 * 12 * 0.075, rel=1e-6)  # annualized then FX'd
 
 
@@ -164,7 +165,7 @@ def test_capture_fx_normalizes_to_revenue_currency():
 def test_full_pipeline_known_factors():
     """Flat 70k history, onboarding (no routed): every factor is known, assert the limit exactly."""
     months = month_range("2025-01", 15)  # 15 months → verified_api 15 → ET 6 → base 3.0
-    chans = [ChannelInput(channel_id="s", channel_type="shopify_payments", currency="GBP",
+    chans = [ChannelInput(channel_id="s", channel_type="shopify_payments",
                           payouts_history=flat_history(months, 70_000))]
     req = make_request(
         chans,
@@ -191,18 +192,18 @@ def test_full_pipeline_known_factors():
 
 
 def test_per_currency_independent_limits():
-    gbp = ChannelInput(channel_id="uk", channel_type="shopify_payments", currency="GBP",
-                       payouts_history=flat_history(month_range("2025-01", 13), 50_000))
-    usd = ChannelInput(channel_id="us", channel_type="shopify_payments", currency="USD",
-                       payouts_history=flat_history(month_range("2025-01", 13), 20_000))
-    resp = compute_limit(make_request([gbp, usd], country="gb"), month("2026-01"), "t")
+    """One Shopify channel settling in two currencies → two independent limits (split inside)."""
+    months = month_range("2025-01", 13)
+    mixed = flat_history(months, 50_000, currency="GBP") + flat_history(months, 20_000, currency="USD")
+    ch = ChannelInput(channel_id="shopify", channel_type="shopify_payments", payouts_history=mixed)
+    resp = compute_limit(make_request([ch], country="gb"), month("2026-01"), "t")
     assert set(resp.limits) == {"GBP", "USD"}
     assert resp.limits["GBP"].dynamic_limit > resp.limits["USD"].dynamic_limit
 
 
 def test_routing_confirmation_derived_from_three_months():
     months = month_range("2025-11", 3)
-    ch = ChannelInput(channel_id="s", channel_type="shopify_payments", currency="GBP",
+    ch = ChannelInput(channel_id="s", channel_type="shopify_payments",
                       payouts_history=flat_history(month_range("2024-01", 24), 50_000),
                       treyd_routed_payouts=flat_history(months, 50_000))
     resp = compute_limit(make_request([ch], country="gb"), month("2026-01"), "t")

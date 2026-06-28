@@ -39,30 +39,36 @@ class MonthlyAmount(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     month: Month = Field(description="Calendar month: 'YYYY-MM' or an ISO date.")
-    amount: float = Field(ge=0.0, description="Positive amount in the channel's currency.")
+    amount: float = Field(ge=0.0, description="Positive amount in this entry's currency.")
+    currency: str = Field(min_length=3, max_length=3, description="ISO-4217 of this settlement, e.g. 'GBP'.")
     encumbered: bool = Field(
         default=False,
         description="On routed entries: True if this settlement repays financed receivables "
         "(excluded from free flow). Defaults False → all free until flagged.",
     )
 
+    @field_validator("currency")
+    @classmethod
+    def _upper_currency(cls, v: str) -> str:
+        return v.upper()
+
 
 class ChannelInput(BaseModel):
-    """One channel × currency stream. A multi-currency Shopify store produces one per currency."""
+    """One channel/integration (e.g. Shopify Payments). Multi-currency settlements are carried on
+    the payout entries; the service splits them into per-currency streams internally."""
 
     model_config = ConfigDict(extra="forbid")
 
     channel_id: str
     channel_type: str = Field(description="Registry key, e.g. 'shopify_payments'.")
-    currency: str = Field(min_length=3, max_length=3, description="ISO-4217, e.g. 'GBP'.")
 
     payouts_history: list[MonthlyAmount] = Field(
         default_factory=list,
-        description="All platform settlements (pre-Treyd and Treyd). Feeds the flow curve and tenure.",
+        description="All platform settlements (pre-Treyd and Treyd), any currency. Feeds flow curve + tenure.",
     )
     treyd_routed_payouts: list[MonthlyAmount] = Field(
         default_factory=list,
-        description="Settlements that actually landed in the Treyd account. Feeds Trailing, capture, RC.",
+        description="Settlements that landed in the Treyd account, any currency. Feeds Trailing, capture, RC.",
     )
     payouts_history_is_accounting: bool = Field(
         default=False,
@@ -71,7 +77,7 @@ class ChannelInput(BaseModel):
     )
     routing_confirmed: bool | None = Field(
         default=None,
-        description="True/False to assert; None → derive from routed history (fallback 0.75).",
+        description="True/False to assert (channel-wide); None → derive per currency (fallback 0.75).",
     )
 
     @field_validator("channel_type")
@@ -80,11 +86,6 @@ class ChannelInput(BaseModel):
         if v not in CHANNEL_REGISTRY:
             raise ValueError(f"unknown channel_type {v!r}; known: {sorted(CHANNEL_REGISTRY)}")
         return v
-
-    @field_validator("currency")
-    @classmethod
-    def _upper_currency(cls, v: str) -> str:
-        return v.upper()
 
 
 class MerchantLimitRequest(BaseModel):

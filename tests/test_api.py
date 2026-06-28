@@ -19,11 +19,10 @@ def _payload(**overrides) -> dict:
             {
                 "channel_id": "shopify",
                 "channel_type": "shopify_payments",
-                "currency": "GBP",
                 "payouts_history": [
-                    {"month": f"2025-{m:02d}", "amount": 50_000.0} for m in range(1, 13)
+                    {"month": f"2025-{m:02d}", "amount": 50_000.0, "currency": "GBP"} for m in range(1, 13)
                 ]
-                + [{"month": "2026-01", "amount": 50_000.0}],
+                + [{"month": "2026-01", "amount": 50_000.0, "currency": "GBP"}],
             }
         ],
     }
@@ -56,9 +55,8 @@ def test_unknown_channel_type_is_422():
 
 def test_missing_fx_rate_is_422():
     p = _payload(revenue_currency="GBP", total_revenue_ltm=1_000_000)
-    p["channels"][0]["currency"] = "SEK"
-    p["channels"][0]["treyd_routed_payouts"] = [{"month": "2025-12", "amount": 100_000.0}]
-    # no fx_rates provided for SEK -> revenue GBP
+    # routed flow settles in SEK but no fx_rates provided for SEK -> revenue GBP
+    p["channels"][0]["treyd_routed_payouts"] = [{"month": "2025-12", "amount": 100_000.0, "currency": "SEK"}]
     r = client.post("/v1/limit", json=p)
     assert r.status_code == 422
     assert "fx rate" in r.json()["detail"].lower()

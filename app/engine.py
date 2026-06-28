@@ -9,11 +9,11 @@ only month-arithmetic helper needed.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import date
 
 from . import config as C
 from .models import (
-    ChannelInput,
     ChannelTrace,
     CurrencyLimit,
     FlowPath,
@@ -100,6 +100,40 @@ def _ltm_avg(series: dict[date, float], t: date) -> float | None:
 
 
 # ────────────────────────────────────────────────────────────────────────────────────────
+# Currency streams — one channel fans out into one stream per settlement currency
+# ────────────────────────────────────────────────────────────────────────────────────────
+@dataclass(frozen=True)
+class _Stream:
+    channel_id: str
+    channel_type: str
+    currency: str
+    payouts: list[MonthlyAmount]
+    routed: list[MonthlyAmount]
+    is_accounting: bool
+    routing_confirmed: bool | None
+
+
+def _streams(req: MerchantLimitRequest) -> list[_Stream]:
+    """Split each channel's multi-currency payouts into one stream per currency."""
+    out: list[_Stream] = []
+    for ch in req.channels:
+        currencies = {e.currency for e in ch.payouts_history} | {e.currency for e in ch.treyd_routed_payouts}
+        for ccy in sorted(currencies):
+            out.append(
+                _Stream(
+                    channel_id=ch.channel_id,
+                    channel_type=ch.channel_type,
+                    currency=ccy,
+                    payouts=[e for e in ch.payouts_history if e.currency == ccy],
+                    routed=[e for e in ch.treyd_routed_payouts if e.currency == ccy],
+                    is_accounting=ch.payouts_history_is_accounting,
+                    routing_confirmed=ch.routing_confirmed,
+                )
+            )
+    return out
+
+
+# ────────────────────────────────────────────────────────────────────────────────────────
 # Merchant-level factors
 # ────────────────────────────────────────────────────────────────────────────────────────
 def _legal_security(instruments: list[str] | None) -> LegalSecurityTrace:
@@ -160,21 +194,21 @@ def _fx_rate(currency: str, revenue_currency: str, fx_rates: dict[str, float]) -
     return rate
 
 
-def _capture_score(req: MerchantLimitRequest, as_of: date) -> tuple[float, float, float]:
+def _capture_score(streams: list[_Stream], req: MerchantLimitRequest, as_of: date) -> tuple[float, float, float]:
     """Returns (capture, capture_score, total_routed_annualized) in revenue_currency.
 
-    Numerator is actual routed flow only (not projected), annualized over the trailing
-    12-month window and FX-normalized into the revenue currency.
+    Numerator is actual routed flow only (not projected), annualized per currency stream over the
+    trailing 12-month window and FX-normalized into the revenue currency.
     """
     window = {_add_months(as_of, -k) for k in range(0, 12)}
     routed_annual = 0.0
-    for ch in req.channels:
-        routed = _free_by_month(ch.treyd_routed_payouts, as_of)
+    for s in streams:
+        routed = _free_by_month(s.routed, as_of)
         vals = [v for m, v in routed.items() if m in window]
         if not vals:
             continue
         annualized = sum(vals) * (12.0 / len(vals))
-        routed_annual += annualized * _fx_rate(ch.currency, req.revenue_currency, req.fx_rates)
+        routed_annual += annualized * _fx_rate(s.currency, req.revenue_currency, req.fx_rates)
 
     if not req.total_revenue_ltm or routed_annual <= 0:
         return 0.0, C.CAPTURE_FLOOR, routed_annual
@@ -186,10 +220,10 @@ def _capture_score(req: MerchantLimitRequest, as_of: date) -> tuple[float, float
 # ────────────────────────────────────────────────────────────────────────────────────────
 # Per-channel computation
 # ────────────────────────────────────────────────────────────────────────────────────────
-def _routing_confirmation(ch: ChannelInput, routed: dict[date, float], projection: dict[date, float]) -> float:
-    if ch.routing_confirmed is True:
+def _routing_confirmation(confirmed: bool | None, routed: dict[date, float], projection: dict[date, float]) -> float:
+    if confirmed is True:
         return 1.0
-    if ch.routing_confirmed is False:
+    if confirmed is False:
         return C.ROUTING_CONFIRMATION_UNCONFIRMED
     if len(routed) >= C.ROUTING_CONFIRM_MIN_MONTHS:
         return 1.0
@@ -211,11 +245,11 @@ def _flow_score(routed: dict[date, float], t: date, expected_oos) -> float:
     return min(1.0, max(C.FLOW_SCORE_FLOOR, ratio))
 
 
-def _compute_channel(
-    ch: ChannelInput, req: MerchantLimitRequest, as_of: date, ls: LegalSecurityTrace, jurisdiction: float
+def _compute_stream(
+    s: _Stream, req: MerchantLimitRequest, as_of: date, ls: LegalSecurityTrace, jurisdiction: float
 ) -> ChannelTrace:
-    routed = _free_by_month(ch.treyd_routed_payouts, as_of)
-    history = _free_by_month(ch.payouts_history, as_of)
+    routed = _free_by_month(s.routed, as_of)
+    history = _free_by_month(s.payouts, as_of)
 
     # Flow source (3-tier): routed if present, else history (provisional haircut if accounting).
     if routed:
@@ -224,8 +258,8 @@ def _compute_channel(
         haircut = 1.0
     elif history:
         source = _dense_series(history, as_of)
-        flow_path = FlowPath.PROVISIONAL if ch.payouts_history_is_accounting else FlowPath.API_HISTORY
-        haircut = C.PROVISIONAL_HAIRCUT if ch.payouts_history_is_accounting else 1.0
+        flow_path = FlowPath.PROVISIONAL if s.is_accounting else FlowPath.API_HISTORY
+        haircut = C.PROVISIONAL_HAIRCUT if s.is_accounting else 1.0
     else:
         source = {}
         flow_path = FlowPath.NONE
@@ -233,10 +267,12 @@ def _compute_channel(
 
     trailing_flow = _weighted_trailing(source, as_of) * haircut
 
-    # Seasonal expectation built from history (longest record), applied to the source level.
+    # Seasonal expectation: both shape AND level come from the long record (history if present,
+    # else the source). Trailing above uses recent actual; the floor uses the long-record level,
+    # so the seasonal floor stays available during the first year of routing.
     seasonal_basis = _dense_series(history, as_of) or source
     sindex = _seasonal_index(seasonal_basis)
-    ltm = _ltm_avg(source, as_of) if source else None
+    ltm = _ltm_avg(seasonal_basis, as_of) if seasonal_basis else None
 
     def expected(m: date) -> float | None:
         if sindex is None or ltm is None:
@@ -273,17 +309,17 @@ def _compute_channel(
 
     flow_score = _flow_score(routed, as_of, expected_oos)
 
-    reg = C.CHANNEL_REGISTRY[ch.channel_type]
+    reg = C.CHANNEL_REGISTRY[s.channel_type]
     v_norm = C.VERIFICATION_NORMS[reg["verification_tier"]]
     ls_norm = ls.norm_platform if reg["flow_type"] == "platform" else ls.norm_b2b
     quality_q = v_norm * ls_norm * jurisdiction * flow_score
-    routing_conf = _routing_confirmation(ch, routed, history)
+    routing_conf = _routing_confirmation(s.routing_confirmed, routed, history)
     contribution = flow_base * quality_q * routing_conf
 
     return ChannelTrace(
-        channel_id=ch.channel_id,
-        channel_type=ch.channel_type,
-        currency=ch.currency,
+        channel_id=s.channel_id,
+        channel_type=s.channel_type,
+        currency=s.currency,
         flow_path=flow_path,
         trailing_flow=round(trailing_flow, 2),
         seasonal_eligible=seasonal_eligible,
@@ -311,9 +347,10 @@ def compute_limit(req: MerchantLimitRequest, as_of: date, computed_at: str) -> M
     as_of = as_of.replace(day=1)
     ls = _legal_security(req.instruments)
     jurisdiction = _jurisdiction(req.country)
+    streams = _streams(req)
 
     verified_api_months = max(
-        (len(_free_by_month(ch.payouts_history, as_of)) for ch in req.channels),
+        (len(_free_by_month(s.payouts, as_of)) for s in streams),
         default=0,
     )
     base_months, effective_tenure, override_used = _base_months(
@@ -324,15 +361,15 @@ def compute_limit(req: MerchantLimitRequest, as_of: date, computed_at: str) -> M
     rating_factor = _map_rating(req.rating_score)
     merchant_score = min(pb_factor, rating_factor)
 
-    capture, capture_score, routed_annual = _capture_score(req, as_of)
+    capture, capture_score, routed_annual = _capture_score(streams, req, as_of)
 
     merchant_multiplier = base_months * capture_score * merchant_score
 
-    # per-channel, grouped by currency
+    # one stream per (channel, currency); group the traces by currency into limits
     by_currency: dict[str, list[ChannelTrace]] = {}
-    for ch in req.channels:
-        trace = _compute_channel(ch, req, as_of, ls, jurisdiction)
-        by_currency.setdefault(ch.currency, []).append(trace)
+    for s in streams:
+        trace = _compute_stream(s, req, as_of, ls, jurisdiction)
+        by_currency.setdefault(s.currency, []).append(trace)
 
     limits: dict[str, CurrencyLimit] = {}
     for ccy, traces in by_currency.items():
