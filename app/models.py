@@ -70,11 +70,6 @@ class ChannelInput(BaseModel):
         default_factory=list,
         description="Settlements that landed in the Treyd account, any currency. Feeds Trailing, capture, RC.",
     )
-    payouts_history_is_accounting: bool = Field(
-        default=False,
-        description="True if payouts_history is accounting/sales estimate rather than verified "
-        "settlements; applies the provisional 0.7 haircut when no routed flow exists yet.",
-    )
     routing_confirmed: bool | None = Field(
         default=None,
         description="True/False to assert (channel-wide); None → derive per currency (fallback 0.75).",
