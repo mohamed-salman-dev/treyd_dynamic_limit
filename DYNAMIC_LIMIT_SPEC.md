@@ -243,19 +243,22 @@ Base_Months = base_months_override if provided else schedule(Effective_Tenure)  
 
 ### Step 3 — Per-channel flow (each currency stream)
 
-**3a. Flow source (3-tier priority).** A single `effective_flow_series` feeds both
-Trailing_Flow and the seasonal curve:
+**3a. Flow source.** The settlement series feeds both Trailing_Flow and the seasonal curve:
 
 | Priority | Condition | Path | Trailing source | Routing_Confirmation |
 |---|---|---|---|---|
 | 1 | `treyd_routed_payouts` present | ROUTED | routed months | 1.0 |
-| 2 | empty; history is api-verified SP payouts | API_HISTORY | payouts at face value | 0.75 |
-| 3 | empty; only accounting/sales totals | PROVISIONAL | × 0.7 haircut | 0.75 |
+| 2 | empty; verified settlement history | API_HISTORY | payouts at face value | 0.75 |
+| 3 | no history at all | NONE | 0 | 0.75 |
 
-> **Sales insights is not the flow source.** Total Sales is all payment methods; only
-> Shopify Payments cash routes to Treyd. In pilot data payouts are a median 0.72 of total
-> sales (range 0.34–0.89), so total sales would overstate routable flow by ~39%. The
-> `× 0.7` PROVISIONAL haircut is empirically near that 0.72 SP-share.
+> **Sales is not the flow source.** Total Sales is all payment methods; only the platform's
+> settled cash routes to Treyd. In pilot data payouts are a median 0.72 of total sales (range
+> 0.34–0.89), so total sales would overstate routable flow by ~39% (3× for low-SP merchants).
+> **Provisional-from-accounting is intentionally not implemented:** there is no accounting
+> input in the contract, so we never reinterpret settlements as sales. If a sales-driven
+> provisional estimate is wanted later, it must arrive as an explicit optional
+> `accounting_revenue` monthly input (× 0.7 haircut applied then) — an additive, non-breaking
+> change. Until then, a merchant with no settlement history simply has no dynamic limit.
 
 **3b. Encumbered deduction.** Free flow per month = sum of routed amounts where
 `encumbered` is false. The flag lives per-entry on `MonthlyAmount` and defaults to `False`,
@@ -268,8 +271,8 @@ financed receivables — no separate input or migration needed.
 Trailing_Flow = 0.5×flow(t-1) + 0.3×flow(t-2) + 0.2×flow(t-3)
 ```
 
-Provisional months fill missing slots and decay to zero by month 3. The weights also give
-a natural 3-month glide from projected (history) to actual (routed) flow.
+Absent months contribute 0. The weights also give a natural 3-month glide from settlement
+history to actual routed flow as the routed series fills in.
 
 **3d. Expected_Flow (≥12 months in this currency stream)**
 
@@ -391,7 +394,7 @@ class CurrencyLimit(BaseModel):
 
 class ChannelTrace(BaseModel):
     channel_id: str; channel_type: str; currency: str
-    flow_path: str                      # ROUTED | API_HISTORY | PROVISIONAL
+    flow_path: str                      # ROUTED | API_HISTORY | NONE
     trailing_flow: float
     seasonal_eligible: bool
     expected_flow_last_month: float | None

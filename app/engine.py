@@ -109,7 +109,6 @@ class _Stream:
     currency: str
     payouts: list[MonthlyAmount]
     routed: list[MonthlyAmount]
-    is_accounting: bool
     routing_confirmed: bool | None
 
 
@@ -126,7 +125,6 @@ def _streams(req: MerchantLimitRequest) -> list[_Stream]:
                     currency=ccy,
                     payouts=[e for e in ch.payouts_history if e.currency == ccy],
                     routed=[e for e in ch.treyd_routed_payouts if e.currency == ccy],
-                    is_accounting=ch.payouts_history_is_accounting,
                     routing_confirmed=ch.routing_confirmed,
                 )
             )
@@ -251,21 +249,18 @@ def _compute_stream(
     routed = _free_by_month(s.routed, as_of)
     history = _free_by_month(s.payouts, as_of)
 
-    # Flow source (3-tier): routed if present, else history (provisional haircut if accounting).
+    # Flow source: actual routed settlements if present, else verified settlement history.
     if routed:
         source = _dense_series(routed, as_of)
         flow_path = FlowPath.ROUTED
-        haircut = 1.0
     elif history:
         source = _dense_series(history, as_of)
-        flow_path = FlowPath.PROVISIONAL if s.is_accounting else FlowPath.API_HISTORY
-        haircut = C.PROVISIONAL_HAIRCUT if s.is_accounting else 1.0
+        flow_path = FlowPath.API_HISTORY
     else:
         source = {}
         flow_path = FlowPath.NONE
-        haircut = 1.0
 
-    trailing_flow = _weighted_trailing(source, as_of) * haircut
+    trailing_flow = _weighted_trailing(source, as_of)
 
     # Seasonal expectation: both shape AND level come from the long record (history if present,
     # else the source). Trailing above uses recent actual; the floor uses the long-record level,
@@ -277,7 +272,7 @@ def _compute_stream(
     def expected(m: date) -> float | None:
         if sindex is None or ltm is None:
             return None
-        return ltm * sindex[m.month] * haircut
+        return ltm * sindex[m.month]
 
     seasonal_eligible = sindex is not None and ltm is not None
     expected_tm1 = expected(_add_months(as_of, -1))

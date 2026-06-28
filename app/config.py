@@ -59,7 +59,6 @@ CAPTURE_FLOOR = 0.50
 
 # ── Flow / seasonal ────────────────────────────────────────────────────────────────────────
 TRAILING_WEIGHTS = (0.5, 0.3, 0.2)     # weights for months t-1, t-2, t-3
-PROVISIONAL_HAIRCUT = 0.7              # applied to accounting-sourced history only
 SEASONAL_FLOOR_GAMMA = 0.8            # Flow_Base = max(Trailing, γ × Forward_Expected)
 FLOOR_GUARD_THRESHOLD = 0.70          # floor holds only if actual(t-1) ≥ this × Expected(t-1)
 MIN_MONTHS_SEASONAL = 12              # months of history required for a seasonal curve

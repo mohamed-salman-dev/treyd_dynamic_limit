@@ -141,10 +141,9 @@ class MerchantLimitRequest(BaseModel):
 # Response / trace
 # ────────────────────────────────────────────────────────────────────────────────────────
 class FlowPath(str, Enum):
-    ROUTED = "routed"
-    API_HISTORY = "api_history"
-    PROVISIONAL = "provisional"
-    NONE = "none"  # no usable history
+    ROUTED = "routed"           # actual Treyd-routed settlements
+    API_HISTORY = "api_history"  # verified settlement history, pre-routing (face value)
+    NONE = "none"               # no usable history
 
 
 class ChannelTrace(BaseModel):
