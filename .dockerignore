@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.git/
+.gitignore
+.ruff_cache/
+.mypy_cache/
+tests/
+*.ipynb
+*.csv
+.vscode/
+.idea/
+DYNAMIC_LIMIT_SPEC.md
+README.md

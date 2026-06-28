@@ -1,0 +1,20 @@
+[project]
+name = "dynamic-limit-explore"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.138.1",
+    "nbformat>=5.10.4",
+    "pandas>=3.0.3",
+    "plotly>=6.8.0",
+    "pydantic>=2.13.4",
+    "uvicorn[standard]>=0.49.0",
+]
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "pytest>=9.1.1",
+]
