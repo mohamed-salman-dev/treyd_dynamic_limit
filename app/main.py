@@ -1,6 +1,6 @@
 """FastAPI surface for the Dynamic Limit Service.
 
-The HTTP layer is thin: resolve `as_of_month` and the timestamp at the edge, delegate to the
+The HTTP layer is thin: resolve `as_of_date` and the timestamp at the edge, delegate to the
 pure engine, and translate domain errors into 422s. All model logic lives in `engine.py`.
 """
 
@@ -29,7 +29,7 @@ def health() -> dict[str, str]:
 @app.post("/v1/limit", response_model=MerchantLimitResponse, tags=["limit"])
 def post_limit(req: MerchantLimitRequest) -> MerchantLimitResponse:
     """Compute the dynamic limit per payout currency for one merchant."""
-    as_of = req.as_of_month or date.today().replace(day=1)
+    as_of = req.as_of_date or date.today()
     computed_at = datetime.now(timezone.utc).isoformat()
     try:
         return compute_limit(req, as_of, computed_at)

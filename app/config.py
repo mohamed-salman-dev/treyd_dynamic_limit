@@ -60,18 +60,27 @@ MERCHANT_SCORE_DEFAULT = 0.8  # null component defaults to mid tier
 CAPTURE_ANCHOR = 0.85
 CAPTURE_FLOOR = 0.50
 
-# ── Flow / seasonal ────────────────────────────────────────────────────────────────────────
-TRAILING_WEIGHTS = (0.5, 0.3, 0.2)     # weights for months t-1, t-2, t-3
-SEASONAL_FLOOR_GAMMA = 0.8            # Flow_Base = max(Trailing, γ × Forward_Expected)
-FLOOR_GUARD_THRESHOLD = 0.70          # floor holds only if actual(t-1) ≥ this × Expected(t-1)
-MIN_MONTHS_SEASONAL = 12              # months of history required for a seasonal curve
-DEFAULT_TENOR_MONTHS = 3             # forward window for Forward_Expected_Flow
+# ── Flow weighting ──────────────────────────────────────────────────────────────────────────
+# Each payout is weighted by whether it routed to Treyd. The provisional (non-routed) weight is
+# the routing discount baked into flow; the blend ramps to full weight as recent days route.
+ROUTED_WEIGHT = 1.0
+PROVISIONAL_WEIGHT = 0.7              # non-routed (pre-Treyd) settlements — discounted
+
+# ── Trailing window (daily) ──────────────────────────────────────────────────────────────────
+TRAILING_WINDOW_DAYS = 90            # flow window measured back from as_of_date
+TRAILING_WEIGHTS = (0.5, 0.3, 0.2)   # recency weights across equal sub-buckets of that window
+
+# ── Seasonal ──────────────────────────────────────────────────────────────────────────────
+SEASONAL_FLOOR_GAMMA = 0.8           # Flow_Base = max(Trailing, γ × Forward_Expected)
+FLOOR_GUARD_THRESHOLD = 0.70         # floor holds only if recent actual ≥ this × Expected
+MIN_MONTHS_SEASONAL = 12             # months of history required for a seasonal curve
+DEFAULT_TENOR_MONTHS = 3             # forward window (months) for Forward_Expected_Flow
 
 # ── Flow_Score ──────────────────────────────────────────────────────────────────────────────
 FLOW_SCORE_FLOOR = 0.6
-FLOW_SCORE_MIN_ROUTED_MONTHS = 2      # inert at 1.0 until this many routed months (pilot)
+FLOW_SCORE_MIN_ROUTED_MONTHS = 2     # inert at 1.0 until this many routed months (pilot)
 
 # ── Routing_Confirmation ──────────────────────────────────────────────────────────────────
-ROUTING_CONFIRMATION_UNCONFIRMED = 0.75
-ROUTING_CONFIRM_MIN_MONTHS = 3        # ≥ this many routed months → confirmed by definition
-ROUTING_CONFIRM_PROJECTION_RATIO = 0.80  # a routed month ≥ this × projected → confirmed
+# Kept as an optional per-channel multiplier, default neutral. The 0.7 provisional weight already
+# carries the routing discount; this is a lever to dial it further if the pilot shows we need it.
+DEFAULT_ROUTING_CONFIRMATION = 1.0

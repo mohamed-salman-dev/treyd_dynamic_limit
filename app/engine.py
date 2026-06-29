@@ -1,27 +1,27 @@
 """Core Dynamic Limit computation — pure functions, no I/O, no wall-clock.
 
-The pipeline mirrors DYNAMIC_LIMIT_SPEC.md §6. Every function is deterministic given its
-inputs; `as_of` truncates all history so a past anchor is an honest, no-lookahead backtest.
-
-Monthly series are dicts keyed by ``datetime.date`` (first of month). ``_add_months`` is the
-only month-arithmetic helper needed.
+Payouts are daily. Each is weighted by whether it routed to Treyd (routed = full, provisional =
+discounted) and excluded if encumbered. Two views are derived from the daily series:
+  • Trailing_Flow — a fixed 90-day window from as_of, recency-weighted across sub-buckets.
+  • Seasonal curve — daily aggregated to calendar months (complete months only), for the
+    seasonal index and LTM level.
+`as_of` truncates everything, so a past anchor is an honest, no-lookahead backtest.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 
 from . import config as C
 from .models import (
     ChannelTrace,
     CurrencyLimit,
-    FlowPath,
     LegalSecurityTrace,
     MerchantLimitRequest,
     MerchantLimitResponse,
     MerchantTrace,
-    MonthlyAmount,
+    Payout,
 )
 
 
@@ -30,53 +30,78 @@ class FxRateMissing(ValueError):
 
 
 def _add_months(d: date, n: int) -> date:
-    """Shift a first-of-month date by ``n`` months (n may be negative)."""
     total = d.month - 1 + n
     return date(d.year + total // 12, total % 12 + 1, 1)
 
 
+def _is_month_end(d: date) -> bool:
+    return (d + timedelta(days=1)).month != d.month
+
+
 # ────────────────────────────────────────────────────────────────────────────────────────
-# Series helpers
+# Daily series helpers
 # ────────────────────────────────────────────────────────────────────────────────────────
-def _free_by_month(entries: list[MonthlyAmount], as_of: date) -> dict[date, float]:
-    """Sparse {month: free amount} for months ≤ as_of. Encumbered amounts excluded."""
+def _weighted_daily(payouts: list[Payout], as_of: date) -> dict[date, float]:
+    """{day: weighted free amount} for days ≤ as_of. Routed → full weight, else provisional;
+    encumbered excluded."""
     out: dict[date, float] = {}
-    for e in entries:
-        if e.month > as_of:  # no lookahead
+    for p in payouts:
+        if p.date > as_of or p.encumbered:
             continue
-        if e.encumbered:
-            continue
-        out[e.month] = out.get(e.month, 0.0) + e.amount
+        weight = C.ROUTED_WEIGHT if p.routed_to_treyd else C.PROVISIONAL_WEIGHT
+        out[p.date] = out.get(p.date, 0.0) + p.amount * weight
     return out
 
 
-def _dense_series(sparse: dict[date, float], as_of: date) -> dict[date, float]:
-    """Contiguous [min..as_of] series with in-range gaps filled as 0.0. Empty if no data."""
-    if not sparse:
-        return {}
+def _routed_daily(payouts: list[Payout], as_of: date) -> dict[date, float]:
+    """{day: full amount} for routed, non-encumbered days ≤ as_of. Used for capture."""
     out: dict[date, float] = {}
-    cur = min(sparse)
-    while cur <= as_of:
-        out[cur] = sparse.get(cur, 0.0)
-        cur = _add_months(cur, 1)
+    for p in payouts:
+        if p.date > as_of or p.encumbered or not p.routed_to_treyd:
+            continue
+        out[p.date] = out.get(p.date, 0.0) + p.amount
     return out
 
 
-def _weighted_trailing(series: dict[date, float], t: date) -> float:
-    """0.5·f(t-1) + 0.3·f(t-2) + 0.2·f(t-3); absent months contribute 0."""
-    return sum(w * series.get(_add_months(t, -k), 0.0) for k, w in enumerate(C.TRAILING_WEIGHTS, start=1))
+def _trailing_flow(daily: dict[date, float], as_of: date) -> float:
+    """Recency-weighted flow over a fixed window: the window is split into equal sub-buckets,
+    one per weight, and each bucket's summed flow is weighted. Yields a representative month."""
+    n = len(C.TRAILING_WEIGHTS)
+    bucket_days = C.TRAILING_WINDOW_DAYS / n
+    total = 0.0
+    for i, w in enumerate(C.TRAILING_WEIGHTS):
+        hi = as_of - timedelta(days=round(bucket_days * i))
+        lo = as_of - timedelta(days=round(bucket_days * (i + 1)))
+        total += w * sum(v for d, v in daily.items() if lo < d <= hi)
+    return total
 
 
-def _seasonal_index(series: dict[date, float]) -> dict[int, float] | None:
+def _monthly_from_daily(daily: dict[date, float], as_of: date) -> dict[date, float]:
+    """Aggregate a daily series into calendar-month buckets keyed by month-start. The as_of month
+    is dropped unless as_of is its last day, so a partial month never pollutes seasonal/LTM."""
+    out: dict[date, float] = {}
+    for d, v in daily.items():
+        key = date(d.year, d.month, 1)
+        out[key] = out.get(key, 0.0) + v
+    if not _is_month_end(as_of):
+        out.pop(date(as_of.year, as_of.month, 1), None)
+    return out
+
+
+def _distinct_months(payouts: list[Payout], as_of: date) -> int:
+    return len({(p.date.year, p.date.month) for p in payouts if p.date <= as_of})
+
+
+def _seasonal_index(monthly: dict[date, float]) -> dict[int, float] | None:
     """Normalized seasonal shape (mean 1.0) by calendar month, or None if < 12 months.
 
     month_avg[c] / overall, 3-month centered (circular) smoothed, then re-normalized to mean 1.0
     so uneven calendar coverage in partial-year windows cannot inflate every expectation.
     """
-    if len(series) < C.MIN_MONTHS_SEASONAL:
+    if len(monthly) < C.MIN_MONTHS_SEASONAL:
         return None
     buckets: dict[int, list[float]] = {c: [] for c in range(1, 13)}
-    for d, val in series.items():
+    for d, val in monthly.items():
         buckets[d.month].append(val)
     if any(not buckets[c] for c in range(1, 13)):
         return None  # not all 12 calendar months represented
@@ -92,11 +117,11 @@ def _seasonal_index(series: dict[date, float]) -> dict[int, float] | None:
     return {c: smoothed[c] / norm for c in range(1, 13)}
 
 
-def _ltm_avg(series: dict[date, float], t: date) -> float | None:
-    """Mean over the trailing 12 months [t-11 .. t]; None if the window predates the data."""
-    if _add_months(t, -11) < min(series):
+def _ltm_avg(monthly: dict[date, float], anchor: date) -> float | None:
+    """Mean over the trailing 12 months [anchor-11 .. anchor]; None if the window predates data."""
+    if _add_months(anchor, -11) < min(monthly):
         return None
-    return sum(series.get(_add_months(t, -k), 0.0) for k in range(0, 12)) / 12.0
+    return sum(monthly.get(_add_months(anchor, -k), 0.0) for k in range(0, 12)) / 12.0
 
 
 # ────────────────────────────────────────────────────────────────────────────────────────
@@ -107,25 +132,22 @@ class _Stream:
     channel_id: str
     channel_type: str
     currency: str
-    payouts: list[MonthlyAmount]
-    routed: list[MonthlyAmount]
-    routing_confirmed: bool | None
+    payouts: list[Payout]
+    routing_confirmation: float
 
 
 def _streams(req: MerchantLimitRequest) -> list[_Stream]:
-    """Split each channel's multi-currency payouts into one stream per currency."""
+    """Split each channel's multi-currency daily payouts into one stream per currency."""
     out: list[_Stream] = []
     for ch in req.channels:
-        currencies = {e.currency for e in ch.payouts_history} | {e.currency for e in ch.treyd_routed_payouts}
-        for ccy in sorted(currencies):
+        for ccy in sorted({p.currency for p in ch.payouts}):
             out.append(
                 _Stream(
                     channel_id=ch.channel_id,
                     channel_type=ch.channel_type,
                     currency=ccy,
-                    payouts=[e for e in ch.payouts_history if e.currency == ccy],
-                    routed=[e for e in ch.treyd_routed_payouts if e.currency == ccy],
-                    routing_confirmed=ch.routing_confirmed,
+                    payouts=[p for p in ch.payouts if p.currency == ccy],
+                    routing_confirmation=ch.routing_confirmation,
                 )
             )
     return out
@@ -176,9 +198,8 @@ def _jurisdiction(country: str | None) -> float:
 def _base_months(routing_days: int, verified_api_months: int, override: float | None) -> tuple[float, float, bool]:
     """Returns (base_months, effective_tenure, override_used).
 
-    Effective_Tenure is in months: routing_days converted at 30 days/month, plus half the verified
-    history (capped at 6 months of credit). 2.0 / 3.0 / 4.0 are all earned by tenure; the override
-    is reserved for above 4.0 — committee review.
+    Effective_Tenure (months) = routing_days/30 + half the verified history (capped at 6 months of
+    credit). 2.0 / 3.0 / 4.0 are all earned by tenure; the override is reserved for above 4.0.
     """
     credit = min(C.HISTORY_CREDIT_FACTOR * verified_api_months, C.HISTORY_CREDIT_CAP)
     effective_tenure = routing_days / C.DAYS_PER_MONTH + credit
@@ -205,17 +226,19 @@ def _fx_rate(currency: str, revenue_currency: str, fx_rates: dict[str, float]) -
 def _capture_score(streams: list[_Stream], req: MerchantLimitRequest, as_of: date) -> tuple[float, float, float]:
     """Returns (capture, capture_score, total_routed_annualized) in revenue_currency.
 
-    Numerator is actual routed flow only (not projected), annualized per currency stream over the
-    trailing 12-month window and FX-normalized into the revenue currency.
+    Numerator is actual routed flow only (full value), summed over the trailing 365 days and
+    annualized over the observed routed span, FX-normalized into the revenue currency.
     """
-    window = {_add_months(as_of, -k) for k in range(0, 12)}
+    lo = as_of - timedelta(days=365)
     routed_annual = 0.0
     for s in streams:
-        routed = _free_by_month(s.routed, as_of)
-        vals = [v for m, v in routed.items() if m in window]
-        if not vals:
+        rd = _routed_daily(s.payouts, as_of)
+        dates = [d for d in rd if lo < d <= as_of]
+        if not dates:
             continue
-        annualized = sum(vals) * (12.0 / len(vals))
+        total = sum(rd[d] for d in dates)
+        span_days = min((as_of - min(dates)).days + 1, 365)
+        annualized = total * 365.0 / max(span_days, 1)
         routed_annual += annualized * _fx_rate(s.currency, req.revenue_currency, req.fx_rates)
 
     if not req.total_revenue_ltm or routed_annual <= 0:
@@ -226,58 +249,29 @@ def _capture_score(streams: list[_Stream], req: MerchantLimitRequest, as_of: dat
 
 
 # ────────────────────────────────────────────────────────────────────────────────────────
-# Per-channel computation
+# Per-stream computation
 # ────────────────────────────────────────────────────────────────────────────────────────
-def _routing_confirmation(confirmed: bool | None, routed: dict[date, float], projection: dict[date, float]) -> float:
-    if confirmed is True:
-        return 1.0
-    if confirmed is False:
-        return C.ROUTING_CONFIRMATION_UNCONFIRMED
-    if len(routed) >= C.ROUTING_CONFIRM_MIN_MONTHS:
-        return 1.0
-    for m, amount in routed.items():
-        proj = projection.get(m, 0.0)
-        if proj > 0 and amount >= C.ROUTING_CONFIRM_PROJECTION_RATIO * proj:
-            return 1.0
-    return C.ROUTING_CONFIRMATION_UNCONFIRMED
-
-
-def _flow_score(routed: dict[date, float], t: date, expected_oos) -> float:
-    """1.0 until ≥2 routed months (pilot inert); then clamp(actual/out-of-sample expected)."""
-    if len([m for m in routed if m <= t]) < C.FLOW_SCORE_MIN_ROUTED_MONTHS:
-        return 1.0
-    exp = expected_oos(_add_months(t, -1))
-    if exp is None or exp <= 0:
-        return 1.0
-    ratio = routed.get(_add_months(t, -1), 0.0) / exp
-    return min(1.0, max(C.FLOW_SCORE_FLOOR, ratio))
-
-
 def _compute_stream(
     s: _Stream, req: MerchantLimitRequest, as_of: date, ls: LegalSecurityTrace, jurisdiction: float
 ) -> ChannelTrace:
-    routed = _free_by_month(s.routed, as_of)
-    history = _free_by_month(s.payouts, as_of)
+    weighted = _weighted_daily(s.payouts, as_of)
+    routed = _routed_daily(s.payouts, as_of)
 
-    # Flow source: actual routed settlements if present, else verified settlement history.
-    if routed:
-        source = _dense_series(routed, as_of)
-        flow_path = FlowPath.ROUTED
-    elif history:
-        source = _dense_series(history, as_of)
-        flow_path = FlowPath.API_HISTORY
-    else:
-        source = {}
-        flow_path = FlowPath.NONE
+    trailing_flow = _trailing_flow(weighted, as_of)
 
-    trailing_flow = _weighted_trailing(source, as_of)
+    # routed share over the trailing window (full value, unweighted) — transparency only
+    win_lo = as_of - timedelta(days=C.TRAILING_WINDOW_DAYS)
+    win = [p for p in s.payouts if win_lo < p.date <= as_of and not p.encumbered]
+    win_total = sum(p.amount for p in win)
+    win_routed = sum(p.amount for p in win if p.routed_to_treyd)
+    routed_share = win_routed / win_total if win_total > 0 else 0.0
 
-    # Seasonal expectation: both shape AND level come from the long record (history if present,
-    # else the source). Trailing above uses recent actual; the floor uses the long-record level,
-    # so the seasonal floor stays available during the first year of routing.
-    seasonal_basis = _dense_series(history, as_of) or source
-    sindex = _seasonal_index(seasonal_basis)
-    ltm = _ltm_avg(seasonal_basis, as_of) if seasonal_basis else None
+    # Seasonal curve from monthly-aggregated weighted flow (complete months only).
+    monthly = _monthly_from_daily(weighted, as_of)
+    sindex = _seasonal_index(monthly)
+    anchor = max(monthly) if monthly else None
+    ltm = _ltm_avg(monthly, anchor) if (monthly and anchor is not None) else None
+    as_of_month = date(as_of.year, as_of.month, 1)
 
     def expected(m: date) -> float | None:
         if sindex is None or ltm is None:
@@ -285,51 +279,58 @@ def _compute_stream(
         return ltm * sindex[m.month]
 
     seasonal_eligible = sindex is not None and ltm is not None
-    expected_tm1 = expected(_add_months(as_of, -1))
-    forward_vals = [e for k in range(1, req.tenor_months + 1) if (e := expected(_add_months(as_of, k))) is not None]
+    expected_anchor = expected(anchor) if anchor is not None else None
+    forward_vals = [e for k in range(1, req.tenor_months + 1) if (e := expected(_add_months(as_of_month, k))) is not None]
     forward_expected = sum(forward_vals) / len(forward_vals) if forward_vals else None
 
     floor_guard_ok = True
     floor_active = False
     flow_base = trailing_flow
-    if seasonal_eligible and forward_expected is not None:
-        actual_tm1 = source.get(_add_months(as_of, -1), 0.0)
-        floor_guard_ok = expected_tm1 is None or actual_tm1 >= C.FLOOR_GUARD_THRESHOLD * expected_tm1
+    if seasonal_eligible and forward_expected is not None and anchor is not None:
+        actual_anchor = monthly.get(anchor, 0.0)
+        floor_guard_ok = expected_anchor is None or actual_anchor >= C.FLOOR_GUARD_THRESHOLD * expected_anchor
         if floor_guard_ok:
             floor_candidate = C.SEASONAL_FLOOR_GAMMA * forward_expected
             if floor_candidate > trailing_flow:
                 flow_base = floor_candidate
                 floor_active = True
 
-    # Out-of-sample expectation for Flow_Score: rebuild from history ≤ t-2.
+    # Flow_Score — inert until ≥2 routed months; then recent actual vs out-of-sample expectation.
     def expected_oos(m: date) -> float | None:
-        cutoff = _add_months(as_of, -2)
-        basis = {k: v for k, v in seasonal_basis.items() if k <= cutoff}
+        if anchor is None:
+            return None
+        cutoff = _add_months(anchor, -1)
+        basis = {k: v for k, v in monthly.items() if k <= cutoff}
+        if not basis:
+            return None
         si = _seasonal_index(basis)
-        level_series = _dense_series(routed, cutoff) or basis
-        lv = _ltm_avg(level_series, cutoff) if level_series else None
+        lv = _ltm_avg(basis, max(basis))
         if si is None or lv is None:
             return None
         return lv * si[m.month]
 
-    flow_score = _flow_score(routed, as_of, expected_oos)
+    routed_months = len(_monthly_from_daily(routed, as_of))
+    flow_score = 1.0
+    if routed_months >= C.FLOW_SCORE_MIN_ROUTED_MONTHS and anchor is not None:
+        e = expected_oos(anchor)
+        if e and e > 0:
+            flow_score = min(1.0, max(C.FLOW_SCORE_FLOOR, monthly.get(anchor, 0.0) / e))
 
     reg = C.CHANNEL_REGISTRY[s.channel_type]
     v_norm = C.VERIFICATION_NORMS[reg["verification_tier"]]
     ls_norm = ls.norm_platform if reg["flow_type"] == "platform" else ls.norm_b2b
     quality_q = v_norm * ls_norm * jurisdiction * flow_score
-    routing_conf = _routing_confirmation(s.routing_confirmed, routed, history)
-    contribution = flow_base * quality_q * routing_conf
+    contribution = flow_base * quality_q * s.routing_confirmation
 
     return ChannelTrace(
         channel_id=s.channel_id,
         channel_type=s.channel_type,
         currency=s.currency,
-        flow_path=flow_path,
         trailing_flow=round(trailing_flow, 2),
+        routed_share=round(routed_share, 6),
         seasonal_eligible=seasonal_eligible,
         ltm_avg=round(ltm, 2) if ltm is not None else None,
-        expected_flow_last_month=round(expected_tm1, 2) if expected_tm1 is not None else None,
+        expected_flow_last_month=round(expected_anchor, 2) if expected_anchor is not None else None,
         forward_expected_flow=round(forward_expected, 2) if forward_expected is not None else None,
         seasonal_floor_active=floor_active,
         floor_guard_ok=floor_guard_ok,
@@ -339,7 +340,7 @@ def _compute_stream(
         jurisdiction=round(jurisdiction, 6),
         flow_score=round(flow_score, 6),
         quality_q=round(quality_q, 6),
-        routing_confirmation=round(routing_conf, 6),
+        routing_confirmation=round(s.routing_confirmation, 6),
         channel_contribution=round(contribution, 2),
     )
 
@@ -349,15 +350,11 @@ def _compute_stream(
 # ────────────────────────────────────────────────────────────────────────────────────────
 def compute_limit(req: MerchantLimitRequest, as_of: date, computed_at: str) -> MerchantLimitResponse:
     """Compute per-currency limits for a merchant. Pure: caller supplies as_of and timestamp."""
-    as_of = as_of.replace(day=1)
     ls = _legal_security(req.instruments)
     jurisdiction = _jurisdiction(req.country)
     streams = _streams(req)
 
-    verified_api_months = max(
-        (len(_free_by_month(s.payouts, as_of)) for s in streams),
-        default=0,
-    )
+    verified_api_months = max((_distinct_months(s.payouts, as_of) for s in streams), default=0)
     base_months, effective_tenure, override_used = _base_months(
         req.routing_days, verified_api_months, req.base_months_override
     )
@@ -367,7 +364,6 @@ def compute_limit(req: MerchantLimitRequest, as_of: date, computed_at: str) -> M
     merchant_score = min(pb_factor, rating_factor)
 
     capture, capture_score, routed_annual = _capture_score(streams, req, as_of)
-
     merchant_multiplier = base_months * capture_score * merchant_score
 
     # one stream per (channel, currency); group the traces by currency into limits
@@ -400,20 +396,23 @@ def compute_limit(req: MerchantLimitRequest, as_of: date, computed_at: str) -> M
         rating_factor=rating_factor,
         legal_security=ls,
         constants_applied={
+            "routed_weight": C.ROUTED_WEIGHT,
+            "provisional_weight": C.PROVISIONAL_WEIGHT,
+            "trailing_window_days": C.TRAILING_WINDOW_DAYS,
+            "trailing_weights": list(C.TRAILING_WEIGHTS),
             "seasonal_floor_gamma": C.SEASONAL_FLOOR_GAMMA,
             "floor_guard_threshold": C.FLOOR_GUARD_THRESHOLD,
             "min_months_seasonal": C.MIN_MONTHS_SEASONAL,
             "capture_anchor": C.CAPTURE_ANCHOR,
             "capture_floor": C.CAPTURE_FLOOR,
             "tenor_months": req.tenor_months,
-            "trailing_weights": list(C.TRAILING_WEIGHTS),
         },
     )
 
     return MerchantLimitResponse(
         merchant_id=req.merchant_id,
         computed_at=computed_at,
-        as_of_month=as_of.strftime("%Y-%m"),
+        as_of_date=as_of.isoformat(),
         revenue_currency=req.revenue_currency,
         limits=limits,
         merchant_trace=merchant_trace,

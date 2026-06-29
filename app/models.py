@@ -1,50 +1,40 @@
 """Request and response (trace) models for the Dynamic Limit Service.
 
-Months are represented as `datetime.date` pinned to the first of the month. The `Month` type
-accepts either a full ISO date or a `"YYYY-MM"` string and normalizes to the first of the month,
-so callers can send `"2026-01"` and Pydantic handles validation.
+Payouts are daily: each entry is a single settlement on a calendar date. The service splits a
+channel's payouts into per-currency streams, weights each by whether it routed to Treyd, and
+computes flow over a fixed trailing window from `as_of_date`.
 """
 
 from __future__ import annotations
 
+import datetime
 from datetime import date
-from enum import Enum
-from typing import Annotated
 
-from pydantic import AfterValidator, BaseModel, BeforeValidator, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from .config import CHANNEL_REGISTRY, INSTRUMENT_SCORES
-
-
-def _coerce_year_month(v: object) -> object:
-    """Turn a bare ``"YYYY-MM"`` into a parseable ISO date; pass anything else through."""
-    if isinstance(v, str) and len(v) == 7 and v[4] == "-":
-        return f"{v}-01"
-    return v
-
-
-def _first_of_month(v: date) -> date:
-    return v.replace(day=1)
-
-
-Month = Annotated[date, BeforeValidator(_coerce_year_month), AfterValidator(_first_of_month)]
+from .config import CHANNEL_REGISTRY, DEFAULT_ROUTING_CONFIRMATION, INSTRUMENT_SCORES
 
 
 # ────────────────────────────────────────────────────────────────────────────────────────
 # Request
 # ────────────────────────────────────────────────────────────────────────────────────────
-class MonthlyAmount(BaseModel):
-    """One month of flow for a channel, in that channel's declared currency."""
+class Payout(BaseModel):
+    """One daily settlement, in its own currency."""
 
     model_config = ConfigDict(extra="forbid")
 
-    month: Month = Field(description="Calendar month: 'YYYY-MM' or an ISO date.")
+    date: datetime.date = Field(description="Settlement date (ISO 'YYYY-MM-DD').")
     amount: float = Field(ge=0.0, description="Positive amount in this entry's currency.")
-    currency: str = Field(min_length=3, max_length=3, description="ISO-4217 of this settlement, e.g. 'GBP'.")
+    currency: str = Field(min_length=3, max_length=3, description="ISO-4217, e.g. 'GBP'.")
+    routed_to_treyd: bool = Field(
+        default=False,
+        description="True if this settlement landed in the Treyd account (full weight). "
+        "False = provisional/pre-Treyd settlement, discounted to the provisional weight.",
+    )
     encumbered: bool = Field(
         default=False,
-        description="On routed entries: True if this settlement repays financed receivables "
-        "(excluded from free flow). Defaults False → all free until flagged.",
+        description="True if this settlement repays financed receivables (excluded from free "
+        "flow). Independent of routed_to_treyd; defaults False → all free until flagged.",
     )
 
     @field_validator("currency")
@@ -54,25 +44,24 @@ class MonthlyAmount(BaseModel):
 
 
 class ChannelInput(BaseModel):
-    """One channel/integration (e.g. Shopify Payments). Multi-currency settlements are carried on
-    the payout entries; the service splits them into per-currency streams internally."""
+    """One channel/integration (e.g. Shopify Payments). Daily, multi-currency payouts are carried
+    on the entries; the service splits them into per-currency streams internally."""
 
     model_config = ConfigDict(extra="forbid")
 
     channel_id: str
     channel_type: str = Field(description="Registry key, e.g. 'shopify_payments'.")
 
-    payouts_history: list[MonthlyAmount] = Field(
+    payouts: list[Payout] = Field(
         default_factory=list,
-        description="All platform settlements (pre-Treyd and Treyd), any currency. Feeds flow curve + tenure.",
+        description="Daily settlements, any currency, each tagged routed_to_treyd / encumbered.",
     )
-    treyd_routed_payouts: list[MonthlyAmount] = Field(
-        default_factory=list,
-        description="Settlements that landed in the Treyd account, any currency. Feeds Trailing, capture, RC.",
-    )
-    routing_confirmed: bool | None = Field(
-        default=None,
-        description="True/False to assert (channel-wide); None → derive per currency (fallback 0.75).",
+    routing_confirmation: float = Field(
+        default=DEFAULT_ROUTING_CONFIRMATION,
+        ge=0.0,
+        le=1.0,
+        description="Optional per-channel multiplier on the channel contribution. Default 1.0 "
+        "(neutral); the provisional weight already carries the routing discount.",
     )
 
     @field_validator("channel_type")
@@ -89,9 +78,9 @@ class MerchantLimitRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     merchant_id: str
-    as_of_month: Month | None = Field(
+    as_of_date: date | None = Field(
         default=None,
-        description="Anchor month. Defaults to current month; a past month is a backtest.",
+        description="Anchor date (ISO 'YYYY-MM-DD'). Defaults to today; a past date is a backtest.",
     )
     tenor_months: int = Field(default=3, ge=1, le=12, description="Forward window for the seasonal floor.")
 
@@ -140,20 +129,14 @@ class MerchantLimitRequest(BaseModel):
 # ────────────────────────────────────────────────────────────────────────────────────────
 # Response / trace
 # ────────────────────────────────────────────────────────────────────────────────────────
-class FlowPath(str, Enum):
-    ROUTED = "routed"           # actual Treyd-routed settlements
-    API_HISTORY = "api_history"  # verified settlement history, pre-routing (face value)
-    NONE = "none"               # no usable history
-
-
 class ChannelTrace(BaseModel):
     channel_id: str
     channel_type: str
     currency: str
-    flow_path: FlowPath
 
     # flow
-    trailing_flow: float
+    trailing_flow: float          # weighted 90-day window (routed + provisional)
+    routed_share: float           # fraction of trailing-window flow that routed to Treyd
     seasonal_eligible: bool
     ltm_avg: float | None
     expected_flow_last_month: float | None
@@ -210,7 +193,7 @@ class CurrencyLimit(BaseModel):
 class MerchantLimitResponse(BaseModel):
     merchant_id: str
     computed_at: str
-    as_of_month: str
+    as_of_date: str
     revenue_currency: str
     limits: dict[str, CurrencyLimit]
     merchant_trace: MerchantTrace

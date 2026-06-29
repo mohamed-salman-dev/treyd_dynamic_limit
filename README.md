@@ -39,7 +39,7 @@ docker run -p 8000:8000 dynamic-limit     # GET /health, POST /v1/limit
 ```bash
 curl -X POST localhost:8000/v1/limit -H 'content-type: application/json' -d '{
   "merchant_id": "demo",
-  "as_of_month": "2026-01",          # omit → current month; a past month is a backtest
+  "as_of_date": "2026-01-31",        # omit → today; a past date is a backtest
   "revenue_currency": "GBP",
   "country": "gb",
   "payment_behaviour_score": 9,
@@ -47,12 +47,15 @@ curl -X POST localhost:8000/v1/limit -H 'content-type: application/json' -d '{
   "channels": [{
     "channel_id": "shopify",
     "channel_type": "shopify_payments",
-    "currency": "GBP",
-    "payouts_history": [{"month": "2025-01", "amount": 40000}, ...],
-    "treyd_routed_payouts": []        # flow actually routed to Treyd; empty pre-launch
+    "payouts": [                      # daily settlements; currency on each entry
+      {"date": "2025-01-15", "amount": 12000, "currency": "GBP", "routed_to_treyd": false},
+      ...
+    ]
   }]
 }'
 ```
+
+See `examples/sample_request.json` for a complete, runnable body.
 
 Returns one limit per payout currency under `limits`, plus a `merchant_trace` and per-channel
 trace carrying every intermediate factor.
@@ -61,9 +64,11 @@ trace carrying every intermediate factor.
 
 - **Per currency.** One limit per payout currency; merchant-level factors (Base_Months,
   Capture_Score, Merchant_Score, Jurisdiction, Legal_Security) apply to each.
-- **`as_of_month` is point-in-time.** History is truncated to the anchor — a past month yields
+- **Daily payouts, tagged.** Each settlement carries `routed_to_treyd` (full weight vs ×0.7
+  provisional) and `encumbered` (excluded from free flow). Flow ramps as days route.
+- **`as_of_date` is point-in-time.** Payouts are truncated to the anchor — a past date yields
   exactly the limit the model would have produced then (backtesting, no lookahead).
 - **Safe defaults.** Missing rating/PBS → 0.8; missing instruments → 0.71 (UK debenture);
-  unknown jurisdiction → 0.6; no routed flow → capture floor 0.5.
+  unknown jurisdiction → 0.6; no routed flow → capture floor 0.5; routing_confirmation → 1.0.
 - **Seasonal floor.** With ≥12 months of history, `Flow_Base = max(Trailing, 0.8 × forward
-  seasonal expectation)`, lifting capacity into a merchant's peak.
+  seasonal expectation)`, lifting capacity into a merchant's peak. Trailing is a fixed 90-day window.

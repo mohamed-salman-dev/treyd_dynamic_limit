@@ -54,16 +54,12 @@ construction — the coverage ceiling is structural, with no separate hard cap.
 
 | This service owns | The calling service owns |
 |---|---|
-| Trailing_Flow (weighted 3-month) | Filtering payouts to Treyd-routed only |
-| Expected_Flow curve + seasonal index | Tagging each payout with its settlement currency |
-| Splitting channels into per-currency streams | — |
-| Seasonal floor + floor guard | Aggregating raw payouts to monthly totals |
-| Legal-security norm from instruments | Fetching FX rates (e.g. Google Sheet) → `fx_rates` |
-| Quality `Q` per channel | Prior displayed limit + glide computation |
-| Capture_Score (with FX normalization) | Drawn-balance maintenance |
+| Per-payout weighting + Trailing_Flow (90-day window) | Tagging each payout `routed_to_treyd` / `encumbered` / `currency` |
+| Splitting channels into per-currency streams | Fetching FX rates (e.g. Google Sheet) → `fx_rates` |
+| Daily→monthly aggregation, seasonal index, floor | Prior displayed limit + glide computation |
+| Quality `Q`, Capture_Score (FX normalization) | Drawn-balance maintenance |
 | Effective_Tenure → Base_Months | Enforcing any freeze/trigger from trace values |
-| Routing_Confirmation (derive or accept) | Pulling instruments record from CRM |
-| Dynamic_Limit + full trace | Pulling PBS + rating; ERP revenue; encumbered flow |
+| Dynamic_Limit + full trace | Pulling instruments / PBS / rating / ERP revenue |
 | All lookup tables | Deciding whether to call (e.g. below-appetite) |
 
 ---
@@ -146,7 +142,7 @@ Effective_Tenure = routing_days / 30 + min(0.5 × verified_api_history_months, 6
 | ≥ 13 | 4.0 | earned by tenure — no override needed |
 | above 4.0 | `base_months_override` | committee individual review only |
 
-`verified_api_history_months` is **derived** from `payouts_history` (count of distinct
+`verified_api_history_months` is **derived** from `payouts` (count of distinct
 months, longest currency stream). The credit caps at 6, so any merchant with ≥12 months of
 history lands at Effective_Tenure 6 → **Base_Months 3.0** at onboarding (`routing_days = 0`).
 **4.0 is earned by routing tenure** — reaching Effective_Tenure ≥ 13 needs ~210 routing days
@@ -176,26 +172,25 @@ zeroes the limit.
 ## 5. Input Contract
 
 ```python
-class MonthlyAmount(BaseModel):
-    month:      str            # "YYYY-MM"
-    amount:     float          # positive, in this entry's currency
-    currency:   str            # ISO-4217 of this settlement — the service splits streams by it
-    encumbered: bool = False   # on routed entries: True = repays financed receivables (excluded
-                               #   from free flow). Defaults False → all free until flagged.
+class Payout(BaseModel):
+    date:            str          # ISO "YYYY-MM-DD" — daily settlement
+    amount:          float        # positive, in this entry's currency
+    currency:        str          # ISO-4217 — the service splits streams by it
+    routed_to_treyd: bool = False # True = landed in Treyd (full weight); False = provisional (×0.7)
+    encumbered:      bool = False # True = repays financed receivables (excluded from free flow).
+                                  #   Independent of routed_to_treyd; default False → all free.
 
 class ChannelInput(BaseModel):
     channel_id:           str
-    channel_type:         str                       # registry key (integration, e.g. shopify_payments)
-    payouts_history:      list[MonthlyAmount]        # all settlements, any currency — flow curve + tenure
-    treyd_routed_payouts: list[MonthlyAmount] = []   # Treyd-routed, any currency — Trailing, capture, RC
-    routing_confirmed:    bool | None         = None # None → derive per currency; fallback 0.75
-    # Currency lives on each MonthlyAmount. A channel = one integration; the service splits its
-    # payouts into one stream per settlement currency (so a Shopify Markets store with 5 currencies
-    # is ONE ChannelInput → 5 streams → 5 limits).
+    channel_type:         str                  # registry key (integration, e.g. shopify_payments)
+    payouts:              list[Payout]          # daily, any currency, each tagged routed/encumbered
+    routing_confirmation: float = 1.0          # optional per-channel multiplier, default neutral
+    # A channel = one integration; the service splits its payouts into one stream per settlement
+    # currency (so a Shopify Markets store with 5 currencies is ONE ChannelInput → 5 limits).
 
 class MerchantLimitRequest(BaseModel):
     merchant_id:   str
-    as_of_month:   str | None = None     # default current month; a past month = backtest
+    as_of_date:    str | None = None     # ISO date; default today; a past date = backtest
     tenor_months:  int        = 3
 
     # merchant-level factors (computed once, applied to every currency limit)
@@ -212,8 +207,11 @@ class MerchantLimitRequest(BaseModel):
     channels:                list[ChannelInput]
 
 # internal constants — echoed into trace, not part of the contract
+ROUTED_WEIGHT         = 1.0
+PROVISIONAL_WEIGHT    = 0.7
+TRAILING_WINDOW_DAYS  = 90
+TRAILING_WEIGHTS      = (0.5, 0.3, 0.2)
 SEASONAL_FLOOR_GAMMA  = 0.8
-YOY_CLAMP             = (0.7, 1.3)
 FLOOR_GUARD_THRESHOLD = 0.70
 MIN_MONTHS_SEASONAL   = 12
 CAPTURE_ANCHOR        = 0.85
@@ -225,7 +223,7 @@ CAPTURE_FLOOR         = 0.50
 ## 6. Computation Pipeline
 
 All steps run per `(merchant, currency)` except the merchant-level factors, which are
-computed once. The service first truncates all history to `≤ as_of_month` so that any
+computed once. The service first truncates all payouts to `≤ as_of_date` so that any
 past anchor is an honest, no-lookahead backtest.
 
 ### Step 1 — Legal_Security_norm (merchant)
@@ -238,42 +236,43 @@ LS_norm(flow_type) = raw / 1.4
 ### Step 2 — Effective_Tenure → Base_Months (merchant)
 
 ```text
-verified_api_history_months = count of months in payouts_history (longest stream)
+verified_api_history_months = count of distinct calendar months in payouts (longest stream)
 Effective_Tenure = routing_days / 30 + min(0.5 × verified_api_history_months, 6)
-Base_Months = base_months_override if provided else schedule(Effective_Tenure)  # caps at 3.0
+Base_Months = base_months_override if provided else schedule(Effective_Tenure)
 ```
 
 ### Step 3 — Per-channel flow (each currency stream)
 
-**3a. Flow source.** The settlement series feeds both Trailing_Flow and the seasonal curve:
-
-| Priority | Condition | Path | Trailing source | Routing_Confirmation |
-|---|---|---|---|---|
-| 1 | `treyd_routed_payouts` present | ROUTED | routed months | 1.0 |
-| 2 | empty; verified settlement history | API_HISTORY | payouts at face value | 0.75 |
-| 3 | no history at all | NONE | 0 | 0.75 |
-
-> **Sales is not the flow source.** Total Sales is all payment methods; only the platform's
-> settled cash routes to Treyd. In pilot data payouts are a median 0.72 of total sales (range
-> 0.34–0.89), so total sales would overstate routable flow by ~39% (3× for low-SP merchants).
-> **Provisional-from-accounting is intentionally not implemented:** there is no accounting
-> input in the contract, so we never reinterpret settlements as sales. If a sales-driven
-> provisional estimate is wanted later, it must arrive as an explicit optional
-> `accounting_revenue` monthly input (× 0.7 haircut applied then) — an additive, non-breaking
-> change. Until then, a merchant with no settlement history simply has no dynamic limit.
-
-**3b. Encumbered deduction.** Free flow per month = sum of routed amounts where
-`encumbered` is false. The flag lives per-entry on `MonthlyAmount` and defaults to `False`,
-so every routed payout is free until the consumer starts flagging settlements that repay
-financed receivables — no separate input or migration needed.
-
-**3c. Trailing_Flow**
+**3a. Per-payout weighting.** Each daily payout is weighted by whether it routed to Treyd. The
+weighted daily series feeds both Trailing_Flow and the seasonal curve:
 
 ```text
-Trailing_Flow = 0.5×flow(t-1) + 0.3×flow(t-2) + 0.2×flow(t-3)
+weight(payout) = 1.0 if routed_to_treyd else 0.7   # provisional weight = the routing discount
+daily_flow(day) = Σ payout.amount × weight   (excluding encumbered)
 ```
 
-Absent months contribute 0. The weights also give a natural 3-month glide from settlement
+The 0.7 provisional weight *is* the routing discount: a merchant's flow ramps smoothly from 0.7
+toward 1.0 as recent days route, rather than stepping. (This replaces the old separate
+Routing_Confirmation step — that factor remains only as an optional per-channel multiplier,
+default 1.0.)
+
+> **Sales is not the flow source.** Total Sales is all payment methods; only settled cash routes
+> to Treyd. In pilot data payouts are a median 0.72 of total sales (range 0.34–0.89), so total
+> sales would overstate routable flow by ~39% (3× for low-SP merchants). Non-routed *settlements*
+> (the 0.7-weighted entries) are the provisional proxy — not sales.
+
+**3b. Encumbered deduction.** A payout is excluded from free flow when `encumbered` is true.
+The flag is per-entry on `Payout`, independent of `routed_to_treyd`, and defaults `False` — all
+free until the consumer flags settlements that repay financed receivables.
+
+**3c. Trailing_Flow — fixed 90-day window.**
+
+```text
+window = 90 days back from as_of_date, split into 3 equal 30-day sub-buckets
+Trailing_Flow = 0.5×bucket(0–30d) + 0.3×bucket(30–60d) + 0.2×bucket(60–90d)
+```
+
+`TRAILING_WINDOW_DAYS` and the weights are config. The weighting gives a natural glide from settlement
 history to actual routed flow as the routed series fills in.
 
 **3d. Expected_Flow (≥12 months in this currency stream)**
@@ -302,7 +301,7 @@ Re-applying the spec's `YoY_growth` on top would double-count, so it is dropped.
 
 **Bug-prevention rules (this section is numerically fragile):**
 
-- Every referenced month must (a) exist in the series and (b) be `≤ as_of_month` — no
+- Every referenced month must (a) exist in the series and (b) be `≤ as_of_date` — no
   lookahead. A real in-range gap reads as 0; an out-of-range month is excluded, never 0.
 - Eligibility requires all 12 calendar months represented in history *and* a full trailing-12m
   window; otherwise `Flow_Base = Trailing_Flow`.
@@ -363,14 +362,13 @@ multi-currency numerator into the single revenue currency.
 
 ```text
 rate(ccy)     = fx_rates[ccy → revenue_currency]   (1.0 if same)
-routed_annual = Σ streams: Σ treyd_routed_payouts[trailing 12m] × rate(ccy)
-                (if <12 routed months: scale available window × 12/n)
+routed_annual = Σ streams: (Σ routed payouts in trailing 365d) × 365/observed_span × rate(ccy)
 Capture       = routed_annual / total_revenue_ltm
 Capture_Score = min(1.0, max(0.50, Capture / 0.85))
 ```
 
-Numerator and denominator must share a time basis: trailing-12m routed ÷ LTM revenue
-(window-matched, seasonality cancels). Pre-launch (no routed flow) → Capture 0 → floor 0.5.
+Routed flow (full value, routed_to_treyd only) annualized over the observed span ÷ LTM revenue.
+Pre-launch (no routed flow) → Capture 0 → floor 0.5.
 
 ### Step 6 — Dynamic_Limit (per currency)
 
@@ -396,8 +394,8 @@ class CurrencyLimit(BaseModel):
 
 class ChannelTrace(BaseModel):
     channel_id: str; channel_type: str; currency: str
-    flow_path: str                      # ROUTED | API_HISTORY | NONE
-    trailing_flow: float
+    trailing_flow: float                # weighted 90-day window
+    routed_share: float                 # fraction of trailing-window flow that routed to Treyd
     seasonal_eligible: bool
     expected_flow_last_month: float | None
     forward_expected_flow: float | None
@@ -419,7 +417,7 @@ class MerchantTrace(BaseModel):
 class MerchantLimitResponse(BaseModel):
     merchant_id: str
     computed_at: str          # ISO-8601 UTC
-    as_of_month: str
+    as_of_date: str
     limits: dict[str, CurrencyLimit]   # keyed by currency
     merchant_trace: MerchantTrace
 ```
@@ -434,7 +432,7 @@ exposed values.
 
 **In scope:** Shopify-only ingestion; per-currency limits; flow source 3-tier priority;
 seasonal floor + guard; Base_Months from tenure; Capture from routed flow; Merchant_Score,
-Jurisdiction, Legal_Security as inputs with defaults; `as_of_month` backtest; full trace.
+Jurisdiction, Legal_Security as inputs with defaults; `as_of_date` backtest; full trace.
 
 **Hardcoded / deferred for the pilot:**
 - `Flow_Score = 1.0` until ≥2 routed months (out-of-sample recalc enabled later).
