@@ -185,6 +185,7 @@ class MerchantTrace(BaseModel):
 
 
 class CurrencyLimit(BaseModel):
+    currency: str
     dynamic_limit: float
     channel_sum: float
     channels: list[ChannelTrace]
@@ -195,5 +196,5 @@ class MerchantLimitResponse(BaseModel):
     computed_at: str
     as_of_date: str
     revenue_currency: str
-    limits: dict[str, CurrencyLimit]
+    limits: list[CurrencyLimit]
     merchant_trace: MerchantTrace

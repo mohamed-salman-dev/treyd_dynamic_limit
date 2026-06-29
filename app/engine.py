@@ -372,13 +372,17 @@ def compute_limit(req: MerchantLimitRequest, as_of: date, computed_at: str) -> M
         trace = _compute_stream(s, req, as_of, ls, jurisdiction)
         by_currency.setdefault(s.currency, []).append(trace)
 
-    limits: dict[str, CurrencyLimit] = {}
-    for ccy, traces in by_currency.items():
+    limits: list[CurrencyLimit] = []
+    for ccy in sorted(by_currency):
+        traces = by_currency[ccy]
         channel_sum = sum(t.channel_contribution for t in traces)
-        limits[ccy] = CurrencyLimit(
-            dynamic_limit=round(merchant_multiplier * channel_sum, 2),
-            channel_sum=round(channel_sum, 2),
-            channels=traces,
+        limits.append(
+            CurrencyLimit(
+                currency=ccy,
+                dynamic_limit=round(merchant_multiplier * channel_sum, 2),
+                channel_sum=round(channel_sum, 2),
+                channels=traces,
+            )
         )
 
     merchant_trace = MerchantTrace(

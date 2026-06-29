@@ -388,6 +388,7 @@ reconstruct it from the trace alone.
 
 ```python
 class CurrencyLimit(BaseModel):
+    currency:       str
     dynamic_limit:  float
     channel_sum:    float
     channels:       list[ChannelTrace]
@@ -412,13 +413,13 @@ class MerchantTrace(BaseModel):
     capture: float; capture_score: float
     merchant_score: float; payment_behaviour_factor: float; rating_factor: float
     legal_security: dict      # instruments, raw + norm per flow_type
-    constants_applied: dict   # γ, YoY clamp, guard threshold, capture anchor/floor
+    constants_applied: dict   # weights, γ, guard threshold, capture anchor/floor, window
 
 class MerchantLimitResponse(BaseModel):
     merchant_id: str
     computed_at: str          # ISO-8601 UTC
     as_of_date: str
-    limits: dict[str, CurrencyLimit]   # keyed by currency
+    limits: list[CurrencyLimit]        # one entry per payout currency
     merchant_trace: MerchantTrace
 ```
 

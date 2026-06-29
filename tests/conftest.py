@@ -63,3 +63,8 @@ def make_request(channels: list[ChannelInput], **overrides) -> MerchantLimitRequ
     defaults = dict(merchant_id="test", revenue_currency="GBP", channels=channels)
     defaults.update(overrides)
     return MerchantLimitRequest(**defaults)
+
+
+def limit_for(resp, currency: str):
+    """Find the CurrencyLimit for a currency in the response limits array."""
+    return next(limit for limit in resp.limits if limit.currency == currency)

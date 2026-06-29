@@ -53,7 +53,8 @@ def test_limit_happy_path():
     r = client.post("/v1/limit", json=_payload())
     assert r.status_code == 200
     body = r.json()
-    assert body["limits"]["GBP"]["dynamic_limit"] > 0
+    gbp = next(limit for limit in body["limits"] if limit["currency"] == "GBP")
+    assert gbp["dynamic_limit"] > 0
     assert body["merchant_trace"]["base_months"] == 3.0
     assert body["as_of_date"] == "2026-01-31"
 
