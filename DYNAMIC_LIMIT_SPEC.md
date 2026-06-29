@@ -136,7 +136,7 @@ the explicit instrument list per merchant; the default applies only when data is
 ### 4.5 Base_Months schedule
 
 ```text
-Effective_Tenure = routing_months + min(0.5 × verified_api_history_months, 6)
+Effective_Tenure = routing_days / 30 + min(0.5 × verified_api_history_months, 6)   # in months
 ```
 
 | Effective_Tenure | Base_Months | Condition |
@@ -148,9 +148,9 @@ Effective_Tenure = routing_months + min(0.5 × verified_api_history_months, 6)
 
 `verified_api_history_months` is **derived** from `payouts_history` (count of distinct
 months, longest currency stream). The credit caps at 6, so any merchant with ≥12 months of
-history lands at Effective_Tenure 6 → **Base_Months 3.0** at onboarding (`routing_months = 0`).
-**4.0 is earned by routing tenure** — reaching Effective_Tenure ≥ 13 needs `routing_months ≥ 7`
-(history credit alone tops out at 6). The override is reserved for limits *above* 4.0.
+history lands at Effective_Tenure 6 → **Base_Months 3.0** at onboarding (`routing_days = 0`).
+**4.0 is earned by routing tenure** — reaching Effective_Tenure ≥ 13 needs ~210 routing days
+(≈7 months; history credit alone tops out at 6). The override is reserved for limits *above* 4.0.
 
 ### 4.6 Merchant_Score components (1–10 raw → factor)
 
@@ -199,7 +199,7 @@ class MerchantLimitRequest(BaseModel):
     tenor_months:  int        = 3
 
     # merchant-level factors (computed once, applied to every currency limit)
-    routing_months:          int                       # onboarding state; 0 pre-launch
+    routing_days:            int                       # onboarding state; 0 pre-launch
     base_months_override:    int | None       = None    # credit sets 4.0 / individual review
     payment_behaviour_score: int | None       = None    # PBS 1–10;    None → 0.8
     rating_score:            int | None       = None    # rating 1–10; None → 0.8 (mid)
@@ -239,7 +239,7 @@ LS_norm(flow_type) = raw / 1.4
 
 ```text
 verified_api_history_months = count of months in payouts_history (longest stream)
-Effective_Tenure = routing_months + min(0.5 × verified_api_history_months, 6)
+Effective_Tenure = routing_days / 30 + min(0.5 × verified_api_history_months, 6)
 Base_Months = base_months_override if provided else schedule(Effective_Tenure)  # caps at 3.0
 ```
 
@@ -409,7 +409,7 @@ class ChannelTrace(BaseModel):
     channel_contribution: float
 
 class MerchantTrace(BaseModel):
-    effective_tenure: float; routing_months: int; verified_api_history_months: int
+    effective_tenure: float; routing_days: int; verified_api_history_months: int
     base_months: float; base_months_override_used: bool
     capture: float; capture_score: float
     merchant_score: float; payment_behaviour_factor: float; rating_factor: float

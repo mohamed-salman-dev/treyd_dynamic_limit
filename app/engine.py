@@ -173,14 +173,15 @@ def _jurisdiction(country: str | None) -> float:
     return C.JURISDICTION_FACTORS.get(country, C.JURISDICTION_DEFAULT) if country else C.JURISDICTION_DEFAULT
 
 
-def _base_months(routing_months: int, verified_api_months: int, override: float | None) -> tuple[float, float, bool]:
+def _base_months(routing_days: int, verified_api_months: int, override: float | None) -> tuple[float, float, bool]:
     """Returns (base_months, effective_tenure, override_used).
 
-    2.0 / 3.0 / 4.0 are all earned by Effective_Tenure (routing months + half verified history,
-    capped at 6 months of credit). The override is reserved for above 4.0 — committee review.
+    Effective_Tenure is in months: routing_days converted at 30 days/month, plus half the verified
+    history (capped at 6 months of credit). 2.0 / 3.0 / 4.0 are all earned by tenure; the override
+    is reserved for above 4.0 — committee review.
     """
     credit = min(C.HISTORY_CREDIT_FACTOR * verified_api_months, C.HISTORY_CREDIT_CAP)
-    effective_tenure = routing_months + credit
+    effective_tenure = routing_days / C.DAYS_PER_MONTH + credit
     if override is not None:
         return float(override), effective_tenure, True
     if effective_tenure < C.TENURE_MID_THRESHOLD:
@@ -358,7 +359,7 @@ def compute_limit(req: MerchantLimitRequest, as_of: date, computed_at: str) -> M
         default=0,
     )
     base_months, effective_tenure, override_used = _base_months(
-        req.routing_months, verified_api_months, req.base_months_override
+        req.routing_days, verified_api_months, req.base_months_override
     )
 
     pb_factor = _map_pbs(req.payment_behaviour_score)
@@ -386,7 +387,7 @@ def compute_limit(req: MerchantLimitRequest, as_of: date, computed_at: str) -> M
 
     merchant_trace = MerchantTrace(
         effective_tenure=round(effective_tenure, 4),
-        routing_months=req.routing_months,
+        routing_days=req.routing_days,
         verified_api_history_months=verified_api_months,
         base_months=base_months,
         base_months_override_used=override_used,

@@ -44,6 +44,7 @@ JURISDICTION_FACTORS: dict[str, float] = {
 JURISDICTION_DEFAULT = 0.6  # unknown → weakest known enforceability
 
 # ── Base_Months / tenure ──────────────────────────────────────────────────────────────────
+DAYS_PER_MONTH = 30.0         # routing_days → months for the tenure calc
 HISTORY_CREDIT_FACTOR = 0.5   # verified API history credited at half
 HISTORY_CREDIT_CAP = 6.0      # max months of credit from history
 BASE_MONTHS_ENTRY = 2.0       # Effective_Tenure < 6

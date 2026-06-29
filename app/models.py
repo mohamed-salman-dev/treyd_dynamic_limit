@@ -96,7 +96,7 @@ class MerchantLimitRequest(BaseModel):
     tenor_months: int = Field(default=3, ge=1, le=12, description="Forward window for the seasonal floor.")
 
     # merchant-level factors (computed once, applied to every currency limit)
-    routing_months: int = Field(default=0, ge=0, description="Months since routing onboarding. 0 pre-launch.")
+    routing_days: int = Field(default=0, ge=0, description="Days since routing onboarding. 0 pre-launch.")
     base_months_override: float | None = Field(
         default=None, ge=0.0, description="Credit override; required only for Base_Months above 4.0."
     )
@@ -183,7 +183,7 @@ class LegalSecurityTrace(BaseModel):
 
 class MerchantTrace(BaseModel):
     effective_tenure: float
-    routing_months: int
+    routing_days: int
     verified_api_history_months: int
     base_months: float
     base_months_override_used: bool
