@@ -72,6 +72,20 @@ class ChannelInput(BaseModel):
         return v
 
 
+class PreviousLimit(BaseModel):
+    """Last run's outcome for one currency, fed back so the service can apply the display glide."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    currency: str = Field(min_length=3, max_length=3)
+    displayed_limit: float = Field(ge=0.0, description="The display_limit returned last cycle.")
+
+    @field_validator("currency")
+    @classmethod
+    def _upper(cls, v: str) -> str:
+        return v.upper()
+
+
 class MerchantLimitRequest(BaseModel):
     """Everything needed to compute a merchant's per-currency limits. Stateless."""
 
@@ -102,6 +116,12 @@ class MerchantLimitRequest(BaseModel):
     revenue_currency: str = Field(min_length=3, max_length=3, description="Currency of total_revenue_ltm.")
     fx_rates: dict[str, float] = Field(
         default_factory=dict, description="{currency: rate to revenue_currency}. revenue_currency implicit 1.0."
+    )
+
+    previous_limits: list[PreviousLimit] = Field(
+        default_factory=list,
+        description="Last cycle's per-currency display limits, for the glide. "
+        "Empty on first run (display_limit then equals the model limit).",
     )
 
     channels: list[ChannelInput] = Field(min_length=1)
@@ -153,7 +173,8 @@ class ChannelTrace(BaseModel):
     quality_q: float
 
     routing_confirmation: float
-    channel_contribution: float
+    channel_contribution: float           # flow side: Flow_Base × Q × routing_confirmation
+    contribution_to_overall_limit: float  # × merchant multipliers — sums to dynamic_limit
 
 
 class LegalSecurityTrace(BaseModel):
@@ -179,6 +200,7 @@ class MerchantTrace(BaseModel):
     merchant_score: float
     payment_behaviour_factor: float
     rating_factor: float
+    glide_delta: float
 
     legal_security: LegalSecurityTrace
     constants_applied: dict
@@ -186,7 +208,8 @@ class MerchantTrace(BaseModel):
 
 class CurrencyLimit(BaseModel):
     currency: str
-    dynamic_limit: float
+    dynamic_limit: float                  # the model limit
+    display_limit: float                  # model limit after the asymmetric glide vs previous
     channel_sum: float
     channels: list[ChannelTrace]
 

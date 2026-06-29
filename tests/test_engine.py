@@ -201,6 +201,36 @@ def test_per_currency_independent_limits():
     assert limit_for(resp, "GBP").dynamic_limit > limit_for(resp, "USD").dynamic_limit
 
 
+def test_contribution_to_overall_limit_sums_to_dynamic():
+    chans = [ChannelInput(channel_id="s", channel_type="shopify_payments", payouts=flat_daily("2025-01", 13, 50_000))]
+    lim = limit_for(compute_limit(make_request(chans, country="gb"), d("2026-01-31"), "t"), "GBP")
+    total = sum(c.contribution_to_overall_limit for c in lim.channels)
+    assert total == pytest.approx(lim.dynamic_limit, abs=1.0)
+
+
+def test_display_limit_glides_decrease_not_increase():
+    from app.models import PreviousLimit
+    chans = [ChannelInput(channel_id="s", channel_type="shopify_payments", payouts=flat_daily("2025-01", 13, 50_000))]
+    # model limit is well below a high previous displayed limit (PBS≥7 → δ=0.15)
+    prev = [PreviousLimit(currency="GBP", displayed_limit=1_000_000)]
+    lim = limit_for(
+        compute_limit(make_request(chans, country="gb", payment_behaviour_score=9, previous_limits=prev), d("2026-01-31"), "t"),
+        "GBP",
+    )
+    assert lim.display_limit == pytest.approx(1_000_000 * 0.85, abs=1.0)   # glides down by δ=0.15
+    assert lim.display_limit > lim.dynamic_limit
+
+
+def test_display_limit_increase_is_immediate():
+    from app.models import PreviousLimit
+    chans = [ChannelInput(channel_id="s", channel_type="shopify_payments", payouts=flat_daily("2025-01", 13, 50_000))]
+    prev = [PreviousLimit(currency="GBP", displayed_limit=1.0)]   # tiny previous → model wins immediately
+    lim = limit_for(
+        compute_limit(make_request(chans, country="gb", previous_limits=prev), d("2026-01-31"), "t"), "GBP"
+    )
+    assert lim.display_limit == lim.dynamic_limit
+
+
 def test_routing_confirmation_multiplier():
     """routing_confirmation is a neutral-by-default multiplier on the contribution."""
     base = ChannelInput(channel_id="s", channel_type="shopify_payments", payouts=flat_daily("2025-01", 13, 50_000))

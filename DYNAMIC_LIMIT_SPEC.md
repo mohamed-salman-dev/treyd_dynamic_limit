@@ -204,7 +204,12 @@ class MerchantLimitRequest(BaseModel):
     revenue_currency:        str
     fx_rates:                dict[str, float]  = {}      # ccy → revenue_currency
 
+    previous_limits: list[PreviousLimit] = []            # last cycle, per currency — for the glide
     channels:                list[ChannelInput]
+
+class PreviousLimit(BaseModel):
+    currency:        str
+    displayed_limit: float          # the display_limit returned last cycle
 
 # internal constants — echoed into trace, not part of the contract
 ROUTED_WEIGHT         = 1.0
@@ -215,6 +220,7 @@ SEASONAL_FLOOR_GAMMA  = 0.8
 FLOOR_GUARD_THRESHOLD = 0.70
 MIN_MONTHS_SEASONAL   = 12
 CAPTURE_ANCHOR        = 0.85
+GLIDE_DELTA           = 0.15 if PBS ≥ 7 else 0.25   # display-limit smoothing
 CAPTURE_FLOOR         = 0.50
 ```
 
@@ -375,9 +381,26 @@ Pre-launch (no routed flow) → Capture 0 → floor 0.5.
 ```text
 channel_contribution(ch) = Flow_Base × V_norm × LS_norm × Jurisdiction
                                      × Flow_Score × Routing_Confirmation
-Dynamic_Limit[ccy] = Base_Months × Capture_Score × Merchant_Score
-                   × Σ channel_contribution(ch in ccy)
+merchant_multiplier      = Base_Months × Capture_Score × Merchant_Score
+contribution_to_overall_limit(ch) = merchant_multiplier × channel_contribution(ch)
+Dynamic_Limit[ccy] = Σ contribution_to_overall_limit(ch in ccy)
 ```
+
+Each channel's `contribution_to_overall_limit` is its slice of the currency's model limit
+(merchant multipliers folded in); they sum to `Dynamic_Limit`.
+
+### Step 7 — Display_Limit (per currency, asymmetric glide)
+
+```text
+δ              = 0.15 if PBS ≥ 7 else 0.25
+glide_floor    = previous_displayed_limit × (1 − δ)   (0 if no previous limit for this currency)
+Display_Limit  = max( Dynamic_Limit , glide_floor )
+```
+
+Increases apply immediately (the model limit wins); decreases glide down by δ per cycle.
+`previous_limits` is fed back by the consumer each cycle — the service stays stateless. A currency
+with a prior limit but no current flow still glides down. (Drawn-balance flooring is deferred —
+the consumer can clamp to drawn balance on their side if needed.)
 
 ---
 
@@ -389,7 +412,8 @@ reconstruct it from the trace alone.
 ```python
 class CurrencyLimit(BaseModel):
     currency:       str
-    dynamic_limit:  float
+    dynamic_limit:  float          # model limit
+    display_limit:  float          # after the asymmetric glide vs previous_limits
     channel_sum:    float
     channels:       list[ChannelTrace]
 
@@ -405,7 +429,8 @@ class ChannelTrace(BaseModel):
     verification_norm: float; legal_security_norm: float
     jurisdiction: float; flow_score: float; Q: float
     routing_confirmation: float
-    channel_contribution: float
+    channel_contribution: float           # flow side (pre-merchant multipliers)
+    contribution_to_overall_limit: float  # × merchant multipliers — sums to dynamic_limit
 
 class MerchantTrace(BaseModel):
     effective_tenure: float; routing_days: int; verified_api_history_months: int

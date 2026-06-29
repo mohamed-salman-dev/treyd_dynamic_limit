@@ -252,7 +252,8 @@ def _capture_score(streams: list[_Stream], req: MerchantLimitRequest, as_of: dat
 # Per-stream computation
 # ────────────────────────────────────────────────────────────────────────────────────────
 def _compute_stream(
-    s: _Stream, req: MerchantLimitRequest, as_of: date, ls: LegalSecurityTrace, jurisdiction: float
+    s: _Stream, req: MerchantLimitRequest, as_of: date, ls: LegalSecurityTrace,
+    jurisdiction: float, merchant_multiplier: float,
 ) -> ChannelTrace:
     weighted = _weighted_daily(s.payouts, as_of)
     routed = _routed_daily(s.payouts, as_of)
@@ -342,6 +343,7 @@ def _compute_stream(
         quality_q=round(quality_q, 6),
         routing_confirmation=round(s.routing_confirmation, 6),
         channel_contribution=round(contribution, 2),
+        contribution_to_overall_limit=round(contribution * merchant_multiplier, 2),
     )
 
 
@@ -366,20 +368,31 @@ def compute_limit(req: MerchantLimitRequest, as_of: date, computed_at: str) -> M
     capture, capture_score, routed_annual = _capture_score(streams, req, as_of)
     merchant_multiplier = base_months * capture_score * merchant_score
 
+    pbs = req.payment_behaviour_score
+    glide_delta = C.GLIDE_DELTA_GOOD_PBS if (pbs is not None and pbs >= C.GLIDE_PBS_THRESHOLD) else C.GLIDE_DELTA_DEFAULT
+    prev_by_ccy = {p.currency: p for p in req.previous_limits}
+
     # one stream per (channel, currency); group the traces by currency into limits
     by_currency: dict[str, list[ChannelTrace]] = {}
     for s in streams:
-        trace = _compute_stream(s, req, as_of, ls, jurisdiction)
+        trace = _compute_stream(s, req, as_of, ls, jurisdiction, merchant_multiplier)
         by_currency.setdefault(s.currency, []).append(trace)
 
+    # include currencies that had a prior limit but no current flow, so they glide down
+    currencies = sorted(set(by_currency) | set(prev_by_ccy))
     limits: list[CurrencyLimit] = []
-    for ccy in sorted(by_currency):
-        traces = by_currency[ccy]
+    for ccy in currencies:
+        traces = by_currency.get(ccy, [])
         channel_sum = sum(t.channel_contribution for t in traces)
+        dynamic_limit = round(merchant_multiplier * channel_sum, 2)
+        prev = prev_by_ccy.get(ccy)
+        glide_floor = prev.displayed_limit * (1 - glide_delta) if prev else 0.0
+        display_limit = round(max(dynamic_limit, glide_floor), 2)
         limits.append(
             CurrencyLimit(
                 currency=ccy,
-                dynamic_limit=round(merchant_multiplier * channel_sum, 2),
+                dynamic_limit=dynamic_limit,
+                display_limit=display_limit,
                 channel_sum=round(channel_sum, 2),
                 channels=traces,
             )
@@ -398,6 +411,7 @@ def compute_limit(req: MerchantLimitRequest, as_of: date, computed_at: str) -> M
         merchant_score=round(merchant_score, 6),
         payment_behaviour_factor=pb_factor,
         rating_factor=rating_factor,
+        glide_delta=glide_delta,
         legal_security=ls,
         constants_applied={
             "routed_weight": C.ROUTED_WEIGHT,
@@ -410,6 +424,8 @@ def compute_limit(req: MerchantLimitRequest, as_of: date, computed_at: str) -> M
             "capture_anchor": C.CAPTURE_ANCHOR,
             "capture_floor": C.CAPTURE_FLOOR,
             "tenor_months": req.tenor_months,
+            "glide_delta_good_pbs": C.GLIDE_DELTA_GOOD_PBS,
+            "glide_delta_default": C.GLIDE_DELTA_DEFAULT,
         },
     )
 

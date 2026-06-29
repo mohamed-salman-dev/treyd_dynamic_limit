@@ -80,6 +80,13 @@ DEFAULT_TENOR_MONTHS = 3             # forward window (months) for Forward_Expec
 FLOW_SCORE_FLOOR = 0.6
 FLOW_SCORE_MIN_ROUTED_MONTHS = 2     # inert at 1.0 until this many routed months (pilot)
 
+# ── Display limit — asymmetric glide (spec §7.2) ───────────────────────────────────────────
+# Displayed_Limit = max(model_limit, prev_displayed × (1 − δ)). Increases apply immediately;
+# decreases glide down by δ per statement cycle.
+GLIDE_DELTA_GOOD_PBS = 0.15          # δ when PBS ≥ threshold
+GLIDE_DELTA_DEFAULT = 0.25           # δ otherwise (incl. unknown PBS)
+GLIDE_PBS_THRESHOLD = 7
+
 # ── Routing_Confirmation ──────────────────────────────────────────────────────────────────
 # Kept as an optional per-channel multiplier, default neutral. The 0.7 provisional weight already
 # carries the routing discount; this is a lever to dial it further if the pilot shows we need it.
