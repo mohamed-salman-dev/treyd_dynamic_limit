@@ -59,6 +59,7 @@ MERCHANT_SCORE_DEFAULT = 0.8  # null component defaults to mid tier
 # ── Capture ────────────────────────────────────────────────────────────────────────────────
 CAPTURE_ANCHOR = 0.85
 CAPTURE_FLOOR = 0.50
+CAPTURE_FALLBACK_NO_FX = 0.60   # used when a routed currency lacks an FX rate to revenue_currency
 
 # ── Flow weighting ──────────────────────────────────────────────────────────────────────────
 # Each payout is weighted by whether it routed to Treyd. The provisional (non-routed) weight is

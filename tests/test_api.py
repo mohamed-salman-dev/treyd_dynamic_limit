@@ -50,7 +50,7 @@ def test_health():
 
 
 def test_limit_happy_path():
-    r = client.post("/v1/limit", json=_payload())
+    r = client.post("/v1/dynamic-limit", json=_payload())
     assert r.status_code == 200
     body = r.json()
     gbp = next(limit for limit in body["limits"] if limit["currency"] == "GBP")
@@ -62,21 +62,21 @@ def test_limit_happy_path():
 def test_unknown_channel_type_is_422():
     bad = _payload()
     bad["channels"][0]["channel_type"] = "carrier_pigeon"
-    assert client.post("/v1/limit", json=bad).status_code == 422
+    assert client.post("/v1/dynamic-limit", json=bad).status_code == 422
 
 
-def test_missing_fx_rate_is_422():
+def test_missing_fx_rate_falls_back_to_capture_06():
     p = _payload(revenue_currency="GBP", total_revenue_ltm=1_000_000)
-    # routed SEK flow but no fx_rates for SEK -> GBP
+    # routed SEK flow but no fx_rates for SEK -> GBP: capture falls back to 0.6, no error
     p["channels"][0]["payouts"] = _daily("2025-11", 2, 100_000, currency="SEK", routed=True)
-    r = client.post("/v1/limit", json=p)
-    assert r.status_code == 422
-    assert "fx rate" in r.json()["detail"].lower()
+    r = client.post("/v1/dynamic-limit", json=p)
+    assert r.status_code == 200
+    assert r.json()["merchant_trace"]["capture_score"] == 0.6
 
 
 def test_as_of_defaults_to_today_when_omitted():
     p = _payload()
     del p["as_of_date"]
-    r = client.post("/v1/limit", json=p)
+    r = client.post("/v1/dynamic-limit", json=p)
     assert r.status_code == 200
     assert r.json()["as_of_date"] == date.today().isoformat()

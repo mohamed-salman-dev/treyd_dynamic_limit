@@ -1,7 +1,7 @@
 # Dynamic Limit Service — API Specification
 
 **Status:** v1.0 (MVP) · derived from *Treyd ONE — Dynamic Limit Model: Production Spec v2.1*
-**Endpoint:** `POST /v1/limit`
+**Endpoint:** `POST /v1/dynamic-limit`
 **Output:** one `Dynamic_Limit` per payout currency, with a full audit trace.
 
 ---
@@ -204,12 +204,12 @@ class MerchantLimitRequest(BaseModel):
     revenue_currency:        str
     fx_rates:                dict[str, float]  = {}      # ccy → revenue_currency
 
-    previous_limits: list[PreviousLimit] = []            # last cycle, per currency — for the glide
+    previous_limits: list[PreviousLimit] = []            # last response's `limits`, fed back verbatim
     channels:                list[ChannelInput]
 
-class PreviousLimit(BaseModel):
-    currency:        str
-    displayed_limit: float          # the display_limit returned last cycle
+class PreviousLimit(BaseModel):          # mirrors an output CurrencyLimit; extra fields ignored
+    currency: str
+    channels: [ { channel_id: str, display_limit: float } ]   # per-channel previous display limits
 
 # internal constants — echoed into trace, not part of the contract
 ROUTED_WEIGHT         = 1.0
@@ -374,7 +374,8 @@ Capture_Score = min(1.0, max(0.50, Capture / 0.85))
 ```
 
 Routed flow (full value, routed_to_treyd only) annualized over the observed span ÷ LTM revenue.
-Pre-launch (no routed flow) → Capture 0 → floor 0.5.
+Pre-launch (no routed flow) → Capture 0 → floor 0.5. **If a routed currency has no FX rate to
+`revenue_currency`, capture can't be computed → `capture_score` falls back to 0.60** (no error).
 
 ### Step 6 — Dynamic_Limit (per currency)
 
@@ -389,18 +390,19 @@ Dynamic_Limit[ccy] = Σ contribution_to_overall_limit(ch in ccy)
 Each channel's `contribution_to_overall_limit` is its slice of the currency's model limit
 (merchant multipliers folded in); they sum to `Dynamic_Limit`.
 
-### Step 7 — Display_Limit (per currency, asymmetric glide)
+### Step 7 — Display_Limit (per channel, asymmetric glide)
 
 ```text
-δ              = 0.15 if PBS ≥ 7 else 0.25
-glide_floor    = previous_displayed_limit × (1 − δ)   (0 if no previous limit for this currency)
-Display_Limit  = max( Dynamic_Limit , glide_floor )
+δ                       = 0.15 if PBS ≥ 7 else 0.25
+glide_floor(ch)         = previous_channel_display(ch) × (1 − δ)   (0 if no previous for this channel)
+channel.display_limit   = max( contribution_to_overall_limit(ch) , glide_floor(ch) )
+Display_Limit[ccy]      = Σ channel.display_limit
 ```
 
-Increases apply immediately (the model limit wins); decreases glide down by δ per cycle.
-`previous_limits` is fed back by the consumer each cycle — the service stays stateless. A currency
-with a prior limit but no current flow still glides down. (Drawn-balance flooring is deferred —
-the consumer can clamp to drawn balance on their side if needed.)
+Each channel glides against **its own** previous display limit; the currency display is their sum.
+Increases apply immediately (the model contribution wins); decreases glide down by δ per cycle.
+`previous_limits` is the consumer feeding back the last response's `limits` verbatim — the service
+stays stateless. (Drawn-balance flooring is deferred — the consumer can clamp on their side.)
 
 ---
 
@@ -412,9 +414,8 @@ reconstruct it from the trace alone.
 ```python
 class CurrencyLimit(BaseModel):
     currency:       str
-    dynamic_limit:  float          # model limit
-    display_limit:  float          # after the asymmetric glide vs previous_limits
-    channel_sum:    float
+    dynamic_limit:  float          # Σ channel contribution_to_overall_limit
+    display_limit:  float          # Σ channel display_limit (each glided vs its own previous)
     channels:       list[ChannelTrace]
 
 class ChannelTrace(BaseModel):
@@ -431,6 +432,7 @@ class ChannelTrace(BaseModel):
     routing_confirmation: float
     channel_contribution: float           # flow side (pre-merchant multipliers)
     contribution_to_overall_limit: float  # × merchant multipliers — sums to dynamic_limit
+    display_limit: float                  # this channel's contribution after its own glide
 
 class MerchantTrace(BaseModel):
     effective_tenure: float; routing_days: int; verified_api_history_months: int
@@ -442,7 +444,6 @@ class MerchantTrace(BaseModel):
 
 class MerchantLimitResponse(BaseModel):
     merchant_id: str
-    computed_at: str          # ISO-8601 UTC
     as_of_date: str
     limits: list[CurrencyLimit]        # one entry per payout currency
     merchant_trace: MerchantTrace

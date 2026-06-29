@@ -31,13 +31,13 @@ uv run pytest -q                          # 45 tests
 
 ```bash
 docker build -t dynamic-limit .
-docker run -p 8000:8000 dynamic-limit     # GET /health, POST /v1/limit
+docker run -p 8000:8000 dynamic-limit     # GET /health, POST /v1/dynamic-limit
 ```
 
 ## Request shape (minimal)
 
 ```bash
-curl -X POST localhost:8000/v1/limit -H 'content-type: application/json' -d '{
+curl -X POST localhost:8000/v1/dynamic-limit -H 'content-type: application/json' -d '{
   "merchant_id": "demo",
   "as_of_date": "2026-01-31",        # omit → today; a past date is a backtest
   "revenue_currency": "GBP",

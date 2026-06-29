@@ -51,7 +51,7 @@ def test_map_rating(rating, expected):
 def test_below_appetite_zeroes_limit():
     chans = [ChannelInput(channel_id="c", channel_type="shopify_payments",
                           payouts=flat_daily("2025-01", 13, 50_000))]
-    resp = compute_limit(make_request(chans, rating_score=2), d("2026-01-31"), "t")
+    resp = compute_limit(make_request(chans, rating_score=2), d("2026-01-31"))
     assert resp.merchant_trace.merchant_score == 0.0
     assert limit_for(resp, "GBP").dynamic_limit == 0.0
 
@@ -102,7 +102,7 @@ def test_thin_history_has_no_seasonal():
 def test_floor_binds_entering_peak():
     payouts = seasonal_daily("2024-01", 21, monthly_base=40_000)  # ends 2025-09
     chans = [ChannelInput(channel_id="shopify", channel_type="shopify_payments", payouts=payouts)]
-    resp = compute_limit(make_request(chans, country="gb"), d("2025-09-30"), "t")
+    resp = compute_limit(make_request(chans, country="gb"), d("2025-09-30"))
     ch = limit_for(resp, "GBP").channels[0]
     assert ch.seasonal_floor_active is True
     assert ch.flow_base > ch.trailing_flow * 2
@@ -111,7 +111,7 @@ def test_floor_binds_entering_peak():
 def test_trailing_wins_post_peak():
     payouts = seasonal_daily("2024-01", 24, monthly_base=40_000)  # ends 2025-12
     chans = [ChannelInput(channel_id="shopify", channel_type="shopify_payments", payouts=payouts)]
-    resp = compute_limit(make_request(chans, country="gb"), d("2025-12-31"), "t")
+    resp = compute_limit(make_request(chans, country="gb"), d("2025-12-31"))
     ch = limit_for(resp, "GBP").channels[0]
     assert ch.seasonal_floor_active is False
     assert ch.flow_base == ch.trailing_flow
@@ -122,8 +122,8 @@ def test_no_lookahead_truncation():
     early = [p for p in payouts if p.date <= d("2025-09-30")]
     full_ch = [ChannelInput(channel_id="s", channel_type="shopify_payments", payouts=payouts)]
     early_ch = [ChannelInput(channel_id="s", channel_type="shopify_payments", payouts=early)]
-    a = compute_limit(make_request(full_ch, country="gb"), d("2025-09-30"), "t")
-    b = compute_limit(make_request(early_ch, country="gb"), d("2025-09-30"), "t")
+    a = compute_limit(make_request(full_ch, country="gb"), d("2025-09-30"))
+    b = compute_limit(make_request(early_ch, country="gb"), d("2025-09-30"))
     assert limit_for(a, "GBP").dynamic_limit == limit_for(b, "GBP").dynamic_limit
 
 
@@ -134,8 +134,8 @@ def test_routed_flow_weighted_higher_than_provisional():
                          payouts=flat_daily("2025-01", 13, 50_000, routed=False))]
     routed = [ChannelInput(channel_id="s", channel_type="shopify_payments",
                            payouts=flat_daily("2025-01", 13, 50_000, routed=True))]
-    lim_prov = limit_for(compute_limit(make_request(prov, country="gb"), d("2026-01-31"), "t"), "GBP")
-    lim_routed = limit_for(compute_limit(make_request(routed, country="gb"), d("2026-01-31"), "t"), "GBP")
+    lim_prov = limit_for(compute_limit(make_request(prov, country="gb"), d("2026-01-31")), "GBP")
+    lim_routed = limit_for(compute_limit(make_request(routed, country="gb"), d("2026-01-31")), "GBP")
     assert lim_routed.channels[0].routed_share == 1.0
     assert lim_prov.channels[0].routed_share == 0.0
     assert lim_routed.dynamic_limit == pytest.approx(lim_prov.dynamic_limit / 0.7, rel=0.02)
@@ -177,7 +177,7 @@ def test_full_pipeline_factors_and_magnitude():
         instruments=["fixed_charge_controlled_account", "floating_charge", "assignment_of_receivables", "pg_cg"],
         total_revenue_ltm=1_400_000,
     )
-    resp = compute_limit(req, d("2026-03-31"), "t")
+    resp = compute_limit(req, d("2026-03-31"))
     mt, ch = resp.merchant_trace, limit_for(resp, "GBP").channels[0]
     assert mt.base_months == 3.0
     assert mt.merchant_score == 0.8
@@ -196,39 +196,49 @@ def test_per_currency_independent_limits():
     """One channel settling GBP + USD → two independent limits (split inside)."""
     mixed = flat_daily("2025-01", 13, 50_000, currency="GBP") + flat_daily("2025-01", 13, 20_000, currency="USD")
     ch = ChannelInput(channel_id="shopify", channel_type="shopify_payments", payouts=mixed)
-    resp = compute_limit(make_request([ch], country="gb"), d("2026-01-31"), "t")
+    resp = compute_limit(make_request([ch], country="gb"), d("2026-01-31"))
     assert {limit.currency for limit in resp.limits} == {"GBP", "USD"}
     assert limit_for(resp, "GBP").dynamic_limit > limit_for(resp, "USD").dynamic_limit
 
 
 def test_contribution_to_overall_limit_sums_to_dynamic():
     chans = [ChannelInput(channel_id="s", channel_type="shopify_payments", payouts=flat_daily("2025-01", 13, 50_000))]
-    lim = limit_for(compute_limit(make_request(chans, country="gb"), d("2026-01-31"), "t"), "GBP")
+    lim = limit_for(compute_limit(make_request(chans, country="gb"), d("2026-01-31")), "GBP")
     total = sum(c.contribution_to_overall_limit for c in lim.channels)
     assert total == pytest.approx(lim.dynamic_limit, abs=1.0)
 
 
 def test_display_limit_glides_decrease_not_increase():
-    from app.models import PreviousLimit
+    from app.models import PreviousChannelLimit, PreviousLimit
     chans = [ChannelInput(channel_id="s", channel_type="shopify_payments", payouts=flat_daily("2025-01", 13, 50_000))]
-    # model limit is well below a high previous displayed limit (PBS≥7 → δ=0.15)
-    prev = [PreviousLimit(currency="GBP", displayed_limit=1_000_000)]
+    # channel's prior display is well above its model contribution (PBS≥7 → δ=0.15)
+    prev = [PreviousLimit(currency="GBP", channels=[PreviousChannelLimit(channel_id="s", display_limit=1_000_000)])]
     lim = limit_for(
-        compute_limit(make_request(chans, country="gb", payment_behaviour_score=9, previous_limits=prev), d("2026-01-31"), "t"),
+        compute_limit(make_request(chans, country="gb", payment_behaviour_score=9, previous_limits=prev), d("2026-01-31")),
         "GBP",
     )
-    assert lim.display_limit == pytest.approx(1_000_000 * 0.85, abs=1.0)   # glides down by δ=0.15
+    assert lim.channels[0].display_limit == pytest.approx(1_000_000 * 0.85, abs=1.0)  # glides down by δ=0.15
+    assert lim.display_limit == lim.channels[0].display_limit                          # currency = Σ channels
     assert lim.display_limit > lim.dynamic_limit
 
 
 def test_display_limit_increase_is_immediate():
-    from app.models import PreviousLimit
+    from app.models import PreviousChannelLimit, PreviousLimit
     chans = [ChannelInput(channel_id="s", channel_type="shopify_payments", payouts=flat_daily("2025-01", 13, 50_000))]
-    prev = [PreviousLimit(currency="GBP", displayed_limit=1.0)]   # tiny previous → model wins immediately
+    prev = [PreviousLimit(currency="GBP", channels=[PreviousChannelLimit(channel_id="s", display_limit=1.0)])]
     lim = limit_for(
-        compute_limit(make_request(chans, country="gb", previous_limits=prev), d("2026-01-31"), "t"), "GBP"
+        compute_limit(make_request(chans, country="gb", previous_limits=prev), d("2026-01-31")), "GBP"
     )
-    assert lim.display_limit == lim.dynamic_limit
+    assert lim.display_limit == lim.dynamic_limit   # tiny previous → model wins immediately
+
+
+def test_previous_limits_accepts_echoed_output():
+    """The previous response's `limits` can be fed back verbatim (extra fields ignored)."""
+    chans = [ChannelInput(channel_id="s", channel_type="shopify_payments", payouts=flat_daily("2025-01", 13, 50_000))]
+    first = compute_limit(make_request(chans, country="gb"), d("2026-01-31"))
+    echoed = [limit.model_dump() for limit in first.limits]   # full output objects
+    second = compute_limit(make_request(chans, country="gb", previous_limits=echoed), d("2026-02-28"))
+    assert limit_for(second, "GBP").display_limit > 0
 
 
 def test_routing_confirmation_multiplier():
@@ -236,6 +246,6 @@ def test_routing_confirmation_multiplier():
     base = ChannelInput(channel_id="s", channel_type="shopify_payments", payouts=flat_daily("2025-01", 13, 50_000))
     dialed = ChannelInput(channel_id="s", channel_type="shopify_payments",
                           payouts=flat_daily("2025-01", 13, 50_000), routing_confirmation=0.5)
-    full = limit_for(compute_limit(make_request([base], country="gb"), d("2026-01-31"), "t"), "GBP").dynamic_limit
-    half = limit_for(compute_limit(make_request([dialed], country="gb"), d("2026-01-31"), "t"), "GBP").dynamic_limit
+    full = limit_for(compute_limit(make_request([base], country="gb"), d("2026-01-31")), "GBP").dynamic_limit
+    half = limit_for(compute_limit(make_request([dialed], country="gb"), d("2026-01-31")), "GBP").dynamic_limit
     assert half == pytest.approx(full * 0.5, rel=1e-6)

@@ -72,13 +72,23 @@ class ChannelInput(BaseModel):
         return v
 
 
-class PreviousLimit(BaseModel):
-    """Last run's outcome for one currency, fed back so the service can apply the display glide."""
+class PreviousChannelLimit(BaseModel):
+    """A channel's display limit from last cycle. Mirrors an output ChannelTrace (extras ignored),
+    so the consumer can feed back the previous response's `limits` verbatim."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
+
+    channel_id: str
+    display_limit: float = Field(ge=0.0)
+
+
+class PreviousLimit(BaseModel):
+    """One currency's previous limits, mirroring an output CurrencyLimit (extras ignored)."""
+
+    model_config = ConfigDict(extra="ignore")
 
     currency: str = Field(min_length=3, max_length=3)
-    displayed_limit: float = Field(ge=0.0, description="The display_limit returned last cycle.")
+    channels: list[PreviousChannelLimit] = Field(default_factory=list)
 
     @field_validator("currency")
     @classmethod
@@ -120,8 +130,8 @@ class MerchantLimitRequest(BaseModel):
 
     previous_limits: list[PreviousLimit] = Field(
         default_factory=list,
-        description="Last cycle's per-currency display limits, for the glide. "
-        "Empty on first run (display_limit then equals the model limit).",
+        description="Last cycle's response `limits` fed back verbatim — used for the per-channel "
+        "display glide. Empty on first run (display_limit then equals the model limit).",
     )
 
     channels: list[ChannelInput] = Field(min_length=1)
@@ -175,6 +185,7 @@ class ChannelTrace(BaseModel):
     routing_confirmation: float
     channel_contribution: float           # flow side: Flow_Base × Q × routing_confirmation
     contribution_to_overall_limit: float  # × merchant multipliers — sums to dynamic_limit
+    display_limit: float                  # this channel's contribution after its own glide
 
 
 class LegalSecurityTrace(BaseModel):
@@ -208,15 +219,13 @@ class MerchantTrace(BaseModel):
 
 class CurrencyLimit(BaseModel):
     currency: str
-    dynamic_limit: float                  # the model limit
-    display_limit: float                  # model limit after the asymmetric glide vs previous
-    channel_sum: float
+    dynamic_limit: float                  # the model limit (Σ channel contributions_to_overall_limit)
+    display_limit: float                  # Σ per-channel display limits (each glided vs its own previous)
     channels: list[ChannelTrace]
 
 
 class MerchantLimitResponse(BaseModel):
     merchant_id: str
-    computed_at: str
     as_of_date: str
     revenue_currency: str
     limits: list[CurrencyLimit]

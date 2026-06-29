@@ -25,10 +25,6 @@ from .models import (
 )
 
 
-class FxRateMissing(ValueError):
-    """Raised when a routed currency has no FX rate to the revenue currency."""
-
-
 def _add_months(d: date, n: int) -> date:
     total = d.month - 1 + n
     return date(d.year + total // 12, total % 12 + 1, 1)
@@ -214,20 +210,12 @@ def _base_months(routing_days: int, verified_api_months: int, override: float | 
     return base, effective_tenure, False
 
 
-def _fx_rate(currency: str, revenue_currency: str, fx_rates: dict[str, float]) -> float:
-    if currency == revenue_currency:
-        return 1.0
-    rate = fx_rates.get(currency)
-    if rate is None:
-        raise FxRateMissing(f"no fx rate for {currency}->{revenue_currency}")
-    return rate
-
-
 def _capture_score(streams: list[_Stream], req: MerchantLimitRequest, as_of: date) -> tuple[float, float, float]:
     """Returns (capture, capture_score, total_routed_annualized) in revenue_currency.
 
     Numerator is actual routed flow only (full value), summed over the trailing 365 days and
-    annualized over the observed routed span, FX-normalized into the revenue currency.
+    annualized over the observed routed span, FX-normalized into the revenue currency. If a routed
+    currency lacks an FX rate, capture can't be computed → fall back to a fixed default score.
     """
     lo = as_of - timedelta(days=365)
     routed_annual = 0.0
@@ -236,10 +224,12 @@ def _capture_score(streams: list[_Stream], req: MerchantLimitRequest, as_of: dat
         dates = [d for d in rd if lo < d <= as_of]
         if not dates:
             continue
+        rate = 1.0 if s.currency == req.revenue_currency else req.fx_rates.get(s.currency)
+        if rate is None:
+            return 0.0, C.CAPTURE_FALLBACK_NO_FX, routed_annual  # missing FX → fixed fallback
         total = sum(rd[d] for d in dates)
         span_days = min((as_of - min(dates)).days + 1, 365)
-        annualized = total * 365.0 / max(span_days, 1)
-        routed_annual += annualized * _fx_rate(s.currency, req.revenue_currency, req.fx_rates)
+        routed_annual += total * 365.0 / max(span_days, 1) * rate
 
     if not req.total_revenue_ltm or routed_annual <= 0:
         return 0.0, C.CAPTURE_FLOOR, routed_annual
@@ -254,6 +244,7 @@ def _capture_score(streams: list[_Stream], req: MerchantLimitRequest, as_of: dat
 def _compute_stream(
     s: _Stream, req: MerchantLimitRequest, as_of: date, ls: LegalSecurityTrace,
     jurisdiction: float, merchant_multiplier: float,
+    prev_channel_display: float | None, glide_delta: float,
 ) -> ChannelTrace:
     weighted = _weighted_daily(s.payouts, as_of)
     routed = _routed_daily(s.payouts, as_of)
@@ -322,6 +313,11 @@ def _compute_stream(
     ls_norm = ls.norm_platform if reg["flow_type"] == "platform" else ls.norm_b2b
     quality_q = v_norm * ls_norm * jurisdiction * flow_score
     contribution = flow_base * quality_q * s.routing_confirmation
+    contribution_overall = contribution * merchant_multiplier
+
+    # per-channel asymmetric glide vs this channel's own previous display limit
+    glide_floor = prev_channel_display * (1 - glide_delta) if prev_channel_display is not None else 0.0
+    display_limit = max(contribution_overall, glide_floor)
 
     return ChannelTrace(
         channel_id=s.channel_id,
@@ -343,14 +339,15 @@ def _compute_stream(
         quality_q=round(quality_q, 6),
         routing_confirmation=round(s.routing_confirmation, 6),
         channel_contribution=round(contribution, 2),
-        contribution_to_overall_limit=round(contribution * merchant_multiplier, 2),
+        contribution_to_overall_limit=round(contribution_overall, 2),
+        display_limit=round(display_limit, 2),
     )
 
 
 # ────────────────────────────────────────────────────────────────────────────────────────
 # Entry point
 # ────────────────────────────────────────────────────────────────────────────────────────
-def compute_limit(req: MerchantLimitRequest, as_of: date, computed_at: str) -> MerchantLimitResponse:
+def compute_limit(req: MerchantLimitRequest, as_of: date) -> MerchantLimitResponse:
     """Compute per-currency limits for a merchant. Pure: caller supplies as_of and timestamp."""
     ls = _legal_security(req.instruments)
     jurisdiction = _jurisdiction(req.country)
@@ -370,30 +367,26 @@ def compute_limit(req: MerchantLimitRequest, as_of: date, computed_at: str) -> M
 
     pbs = req.payment_behaviour_score
     glide_delta = C.GLIDE_DELTA_GOOD_PBS if (pbs is not None and pbs >= C.GLIDE_PBS_THRESHOLD) else C.GLIDE_DELTA_DEFAULT
-    prev_by_ccy = {p.currency: p for p in req.previous_limits}
+    # previous display limit per (currency, channel_id), from last cycle's response fed back
+    prev_display = {
+        (p.currency, ch.channel_id): ch.display_limit for p in req.previous_limits for ch in p.channels
+    }
 
-    # one stream per (channel, currency); group the traces by currency into limits
+    # one stream per (channel, currency); each channel glides vs its own previous display limit
     by_currency: dict[str, list[ChannelTrace]] = {}
     for s in streams:
-        trace = _compute_stream(s, req, as_of, ls, jurisdiction, merchant_multiplier)
+        prev = prev_display.get((s.currency, s.channel_id))
+        trace = _compute_stream(s, req, as_of, ls, jurisdiction, merchant_multiplier, prev, glide_delta)
         by_currency.setdefault(s.currency, []).append(trace)
 
-    # include currencies that had a prior limit but no current flow, so they glide down
-    currencies = sorted(set(by_currency) | set(prev_by_ccy))
     limits: list[CurrencyLimit] = []
-    for ccy in currencies:
-        traces = by_currency.get(ccy, [])
-        channel_sum = sum(t.channel_contribution for t in traces)
-        dynamic_limit = round(merchant_multiplier * channel_sum, 2)
-        prev = prev_by_ccy.get(ccy)
-        glide_floor = prev.displayed_limit * (1 - glide_delta) if prev else 0.0
-        display_limit = round(max(dynamic_limit, glide_floor), 2)
+    for ccy in sorted(by_currency):
+        traces = by_currency[ccy]
         limits.append(
             CurrencyLimit(
                 currency=ccy,
-                dynamic_limit=dynamic_limit,
-                display_limit=display_limit,
-                channel_sum=round(channel_sum, 2),
+                dynamic_limit=round(sum(t.contribution_to_overall_limit for t in traces), 2),
+                display_limit=round(sum(t.display_limit for t in traces), 2),
                 channels=traces,
             )
         )
@@ -431,7 +424,6 @@ def compute_limit(req: MerchantLimitRequest, as_of: date, computed_at: str) -> M
 
     return MerchantLimitResponse(
         merchant_id=req.merchant_id,
-        computed_at=computed_at,
         as_of_date=as_of.isoformat(),
         revenue_currency=req.revenue_currency,
         limits=limits,
