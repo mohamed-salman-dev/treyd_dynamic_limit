@@ -107,6 +107,10 @@ class MerchantLimitRequest(BaseModel):
         description="Anchor date (ISO 'YYYY-MM-DD'). Defaults to today; a past date is a backtest.",
     )
     tenor_months: int = Field(default=3, ge=1, le=12, description="Forward window for the seasonal floor.")
+    expected_flow_eligible: bool = Field(
+        default=False,
+        description="Enable forward expected flow for this merchant. Requires ≥12 months of history.",
+    )
 
     # merchant-level factors (computed once, applied to every currency limit)
     routing_days: int = Field(default=0, ge=0, description="Days since routing onboarding. 0 pre-launch.")

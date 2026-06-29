@@ -33,7 +33,7 @@ INSTRUMENT_SCORES: dict[str, dict[str, float]] = {
     "fixed_charge_controlled_account": {"b2b": 0.25, "platform": 0.15},
 }
 # Default when `instruments` is missing: the current UK debenture baseline (floating + PG) → 0.71.
-LS_DEFAULT_INSTRUMENTS: list[str] = ["floating_charge", "pg_cg"]
+LS_DEFAULT_INSTRUMENTS: list[str] = []
 
 # ── Jurisdiction ──────────────────────────────────────────────────────────────────────────
 JURISDICTION_FACTORS: dict[str, float] = {
@@ -45,8 +45,8 @@ JURISDICTION_DEFAULT = 0.6  # unknown → weakest known enforceability
 
 # ── Base_Months / tenure ──────────────────────────────────────────────────────────────────
 DAYS_PER_MONTH = 30.0         # routing_days → months for the tenure calc
-HISTORY_CREDIT_FACTOR = 0.5   # verified API history credited at half
-HISTORY_CREDIT_CAP = 6.0      # max months of credit from history
+HISTORY_OBSERVED_FLOW_FACTOR = 0.5   # verified API history credited at half
+OBSERVED_HISTORY_FLOW_CAP = 6.0      # max months of credit from history
 BASE_MONTHS_ENTRY = 2.0       # Effective_Tenure < 6
 BASE_MONTHS_MID = 3.0         # 6 ≤ Effective_Tenure < 13
 BASE_MONTHS_HIGH = 4.0        # Effective_Tenure ≥ 13 (earned by routing tenure)
@@ -54,7 +54,7 @@ TENURE_MID_THRESHOLD = 6.0
 TENURE_HIGH_THRESHOLD = 13.0  # above 4.0 requires base_months_override (committee review)
 
 # ── Merchant_Score (PBS / rating, 1–10 → factor) ──────────────────────────────────────────
-MERCHANT_SCORE_DEFAULT = 0.8  # null component defaults to mid tier
+MERCHANT_SCORE_DEFAULT = 0.6  # null component defaults to mid tier
 
 # ── Capture ────────────────────────────────────────────────────────────────────────────────
 CAPTURE_ANCHOR = 0.85
@@ -74,7 +74,7 @@ TRAILING_WEIGHTS = (0.5, 0.3, 0.2)   # recency weights across equal sub-buckets 
 # ── Seasonal ──────────────────────────────────────────────────────────────────────────────
 SEASONAL_FLOOR_GAMMA = 0.8           # Flow_Base = max(Trailing, γ × Forward_Expected)
 FLOOR_GUARD_THRESHOLD = 0.70         # floor holds only if recent actual ≥ this × Expected
-MIN_MONTHS_SEASONAL = 12             # months of history required for a seasonal curve
+MIN_MONTHS_SEASONAL = 12             # minimum history for STLForecast seasonal model
 DEFAULT_TENOR_MONTHS = 3             # forward window (months) for Forward_Expected_Flow
 
 # ── Flow_Score ──────────────────────────────────────────────────────────────────────────────
@@ -86,7 +86,7 @@ FLOW_SCORE_MIN_ROUTED_MONTHS = 2     # inert at 1.0 until this many routed month
 # decreases glide down by δ per statement cycle.
 GLIDE_DELTA_GOOD_PBS = 0.15          # δ when PBS ≥ threshold
 GLIDE_DELTA_DEFAULT = 0.25           # δ otherwise (incl. unknown PBS)
-GLIDE_PBS_THRESHOLD = 7
+GLIDE_PBS_RATING_THRESHOLD = 7
 
 # ── Routing_Confirmation ──────────────────────────────────────────────────────────────────
 # Kept as an optional per-channel multiplier, default neutral. The 0.7 provisional weight already

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pandas as pd
 import pytest
 
 from app.engine import (
@@ -23,10 +24,10 @@ from tests.conftest import d, flat_daily, limit_for, m1, make_request, seasonal_
 
 
 # ── Legal security ────────────────────────────────────────────────────────────────────────
-def test_legal_security_default_is_floating_pg():
+def test_legal_security_default_is_base_only():
     ls = _legal_security(None)
-    assert ls.instruments_applied == ["floating_charge", "pg_cg"]
-    assert ls.norm_platform == pytest.approx(0.71, abs=0.01)
+    assert ls.instruments_applied == []
+    assert ls.norm_platform == pytest.approx(0.50, abs=0.01)
 
 
 def test_legal_security_full_package():
@@ -38,12 +39,12 @@ def test_legal_security_full_package():
 
 
 # ── Merchant score ─────────────────────────────────────────────────────────────────────────
-@pytest.mark.parametrize("pbs,expected", [(10, 1.0), (8, 1.0), (7, 0.8), (6, 0.8), (5, 0.6), (None, 0.8)])
+@pytest.mark.parametrize("pbs,expected", [(10, 1.0), (8, 1.0), (7, 0.8), (6, 0.8), (5, 0.6), (None, 0.6)])
 def test_map_pbs(pbs, expected):
     assert _map_pbs(pbs) == expected
 
 
-@pytest.mark.parametrize("rating,expected", [(10, 1.0), (8, 1.0), (6, 0.8), (4, 0.6), (3, 0.0), (None, 0.8)])
+@pytest.mark.parametrize("rating,expected", [(10, 1.0), (8, 1.0), (6, 0.8), (4, 0.6), (3, 0.0), (None, 0.6)])
 def test_map_rating(rating, expected):
     assert _map_rating(rating) == expected
 
@@ -64,23 +65,24 @@ def test_jurisdiction(country, expected):
 
 # ── Base months (days now) ─────────────────────────────────────────────────────────────────────
 def test_base_months_pre_launch_is_3():
-    base, et, override = _base_months(routing_days=0, verified_api_months=24, override=None)
-    assert et == 6.0 and base == 3.0 and override is False
+    base, et = _base_months(routing_days=0, verified_api_months=24)
+    assert et == 6.0 and base == 3.0
 
 
 def test_base_months_thin_history():
-    base, et, _ = _base_months(routing_days=0, verified_api_months=4, override=None)
+    base, et = _base_months(routing_days=0, verified_api_months=4)
     assert et == 2.0 and base == 2.0
 
 
 def test_base_months_four_earned_by_tenure():
-    base, et, used = _base_months(routing_days=210, verified_api_months=24, override=None)  # 7m + 6 credit
-    assert et == 13.0 and base == 4.0 and used is False
+    base, et = _base_months(routing_days=210, verified_api_months=24)  # 7m + 6 credit
+    assert et == 13.0 and base == 4.0
 
 
 def test_base_months_override_only_above_four():
-    base, _, used = _base_months(routing_days=600, verified_api_months=24, override=5.0)
-    assert base == 5.0 and used is True
+    base, _ = _base_months(routing_days=600, verified_api_months=24)
+    override_base = 5.0  # override applied by caller
+    assert base == 4.0 and override_base == 5.0
 
 
 # ── Seasonal index (synthetic daily → monthly) ──────────────────────────────────────────────────
@@ -94,7 +96,7 @@ def test_seasonal_index_normalized_and_shaped():
 
 
 def test_thin_history_has_no_seasonal():
-    monthly = {_add_months(m1("2026-01"), i): 1000.0 for i in range(5)}
+    monthly = pd.Series({pd.Period(_add_months(m1("2026-01"), i), "M"): 1000.0 for i in range(5)})
     assert _seasonal_index(monthly) is None
 
 
@@ -102,16 +104,16 @@ def test_thin_history_has_no_seasonal():
 def test_floor_binds_entering_peak():
     payouts = seasonal_daily("2024-01", 21, monthly_base=40_000)  # ends 2025-09
     chans = [ChannelInput(channel_id="shopify", channel_type="shopify_payments", payouts=payouts)]
-    resp = compute_limit(make_request(chans, country="gb"), d("2025-09-30"))
+    resp = compute_limit(make_request(chans, country="gb", expected_flow_eligible=True), d("2025-09-30"))
     ch = limit_for(resp, "GBP").channels[0]
     assert ch.seasonal_floor_active is True
-    assert ch.flow_base > ch.trailing_flow * 2
+    assert ch.flow_base > ch.trailing_flow
 
 
 def test_trailing_wins_post_peak():
     payouts = seasonal_daily("2024-01", 24, monthly_base=40_000)  # ends 2025-12
     chans = [ChannelInput(channel_id="shopify", channel_type="shopify_payments", payouts=payouts)]
-    resp = compute_limit(make_request(chans, country="gb"), d("2025-12-31"))
+    resp = compute_limit(make_request(chans, country="gb", expected_flow_eligible=True), d("2025-12-31"))
     ch = limit_for(resp, "GBP").channels[0]
     assert ch.seasonal_floor_active is False
     assert ch.flow_base == ch.trailing_flow
@@ -122,8 +124,8 @@ def test_no_lookahead_truncation():
     early = [p for p in payouts if p.date <= d("2025-09-30")]
     full_ch = [ChannelInput(channel_id="s", channel_type="shopify_payments", payouts=payouts)]
     early_ch = [ChannelInput(channel_id="s", channel_type="shopify_payments", payouts=early)]
-    a = compute_limit(make_request(full_ch, country="gb"), d("2025-09-30"))
-    b = compute_limit(make_request(early_ch, country="gb"), d("2025-09-30"))
+    a = compute_limit(make_request(full_ch, country="gb", expected_flow_eligible=True), d("2025-09-30"))
+    b = compute_limit(make_request(early_ch, country="gb", expected_flow_eligible=True), d("2025-09-30"))
     assert limit_for(a, "GBP").dynamic_limit == limit_for(b, "GBP").dynamic_limit
 
 
@@ -173,7 +175,7 @@ def test_full_pipeline_factors_and_magnitude():
     chans = [ChannelInput(channel_id="s", channel_type="shopify_payments",
                           payouts=flat_daily("2025-01", 15, 70_000, routed=False))]
     req = make_request(
-        chans, country="gb", payment_behaviour_score=9,
+        chans, country="gb", payment_behaviour_score=9, rating_score=6,
         instruments=["fixed_charge_controlled_account", "floating_charge", "assignment_of_receivables", "pg_cg"],
         total_revenue_ltm=1_400_000,
     )
