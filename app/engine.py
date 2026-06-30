@@ -29,10 +29,6 @@ from .models import (
 )
 
 
-def _add_months(d: date, n: int) -> date:
-    total = d.month - 1 + n
-    return date(d.year + total // 12, total % 12 + 1, 1)
-
 
 def _is_month_end(d: date) -> bool:
     return (d + timedelta(days=1)).month != d.month
@@ -44,14 +40,17 @@ def _is_month_end(d: date) -> bool:
 def _payouts_df(payouts: list[Payout]) -> pd.DataFrame:
     """All payouts as a DataFrame. Callers apply their own filters."""
     if not payouts:
-        return pd.DataFrame(columns=["date", "amount", "routed_to_treyd", "encumbered"])
-    return pd.DataFrame([{"date": p.date, "amount": p.amount, "routed_to_treyd": p.routed_to_treyd, "encumbered": p.encumbered} for p in payouts])
+        return pd.DataFrame(columns=["date", "amount", "currency", "routed_to_treyd", "encumbered"])
+    return pd.DataFrame([
+        {"date": p.date, "amount": p.amount, "currency": p.currency,
+         "routed_to_treyd": p.routed_to_treyd, "encumbered": p.encumbered}
+        for p in payouts
+    ])
 
 
-def _weighted_daily(payouts: list[Payout], as_of: date) -> pd.DataFrame:
+def _weighted_daily(df: pd.DataFrame, as_of: date) -> pd.DataFrame:
     """Daily weighted free amounts up to as_of. Returns DataFrame[date, amount].
     Routed → full weight, provisional → discounted; encumbered excluded."""
-    df = _payouts_df(payouts)
     if df.empty:
         return pd.DataFrame(columns=["date", "amount"])
     df = df[(df["date"] <= as_of) & ~df["encumbered"]].copy()
@@ -59,9 +58,8 @@ def _weighted_daily(payouts: list[Payout], as_of: date) -> pd.DataFrame:
     return df.groupby("date", as_index=False)["amount"].sum()
 
 
-def _routed_daily(payouts: list[Payout], as_of: date) -> pd.DataFrame:
+def _routed_daily(df: pd.DataFrame, as_of: date) -> pd.DataFrame:
     """Routed, non-encumbered payouts up to as_of."""
-    df = _payouts_df(payouts)
     if df.empty:
         return df[["date", "amount"]]
     return df[(df["date"] <= as_of) & df["routed_to_treyd"] & ~df["encumbered"]][["date", "amount"]].reset_index(drop=True)
@@ -91,39 +89,40 @@ def _monthly_from_daily(daily: pd.DataFrame, as_of: date) -> pd.Series:
     return monthly
 
 
-def _distinct_months(payouts: list[Payout], as_of: date) -> int:
-    df = _payouts_df(payouts)
+def _distinct_months(df: pd.DataFrame, as_of: date) -> int:
     if df.empty:
         return 0
     return pd.to_datetime(df[df["date"] <= as_of]["date"]).dt.to_period("M").nunique()
 
 
-def _seasonal_index(monthly: pd.Series) -> dict[int, float] | None:
-    """Normalized seasonal shape (mean 1.0) by calendar month, or None if < 12 months.
+def _seasonal_index_forecast(monthly: pd.Series, tenor_months: int) -> float | None:
+    """Legacy spec §3.3 seasonal-index forecast. Not called by the production path (replaced by
+    STLForecast). Kept as reference implementation.
 
-    3-month centered (circular) smoothed, then re-normalized to mean 1.0.
+    Requires ≥ 24 months (two full years) — one for the index, one for YoY growth.
+    Returns Forward_Expected_Flow (average Expected_Flow over tenor_months) or None.
     """
-    if len(monthly) < 12:
+    if len(monthly) < 24:
         return None
-    by_month = monthly.groupby(monthly.index.month).mean()
-    if len(by_month) < 12:
-        return None  # not all 12 calendar months represented
-    overall = by_month.mean()
-    if overall <= 0:
-        return None
-    raw = (by_month / overall).to_dict()
-    smoothed = {c: (raw[(c - 2) % 12 + 1] + raw[c] + raw[c % 12 + 1]) / 3.0 for c in range(1, 13)}
-    norm = sum(smoothed.values()) / 12.0
-    if norm <= 0:
-        return None
-    return {c: smoothed[c] / norm for c in range(1, 13)}
+    start, end = monthly.index.min(), monthly.index.max()
+    series = monthly.reindex(pd.period_range(start, end, freq="M"), fill_value=0.0)
 
-
-def _ltm_avg(monthly: pd.Series) -> float | None:
-    """Mean of the last 12 months; None if fewer than 12 available."""
-    if len(monthly) < 12:
+    prior_year = series.iloc[-12:]
+    ltm_avg = float(prior_year.mean())
+    if ltm_avg <= 0:
         return None
-    return float(monthly.iloc[-12:].mean())
+
+    # Seasonal index: 3-month centered rolling mean on prior year, normalised by LTM avg
+    smoothed = prior_year.rolling(3, center=True, min_periods=1).mean()
+    si_by_month = {p.month: float(v) / ltm_avg for p, v in smoothed.items()}
+
+    # YoY growth: LTM avg over the year before the prior year, clamped
+    prev_year_avg = float(series.iloc[-24:-12].mean())
+    yoy = min(1.3, max(0.7, ltm_avg / prev_year_avg)) if prev_year_avg > 0 else 1.0
+
+    next_period = series.index.max() + 1
+    expected = [ltm_avg * si_by_month.get((next_period + i).month, 1.0) * yoy for i in range(tenor_months)]
+    return sum(expected) / len(expected)
 
 
 @dataclass(frozen=True)
@@ -131,15 +130,12 @@ class _SeasonalFlow:
     seasonal_eligible: bool
     ltm_avg: float | None
     forward_expected: float | None
-    floor_guard_ok: bool
 
 
 def _seasonal_flow(monthly: pd.Series, tenor_months: int) -> _SeasonalFlow:
     """Forward expected flow via STLForecast + ETS(A,A,N) with per-month YoY clamp.
-    Returns seasonal_eligible=False if < 12 months of history or model fails."""
-    _ineligible = _SeasonalFlow(seasonal_eligible=False, ltm_avg=None, forward_expected=None, floor_guard_ok=True)
-    if len(monthly) < C.MIN_MONTHS_SEASONAL:
-        return _ineligible
+    Assumes eligibility has already been checked by the caller."""
+    _ineligible = _SeasonalFlow(seasonal_eligible=False, ltm_avg=None, forward_expected=None)
 
     start, end = monthly.index.min(), monthly.index.max()
     series = monthly.reindex(pd.period_range(start, end, freq="M"), fill_value=0.0)
@@ -166,12 +162,7 @@ def _seasonal_flow(monthly: pd.Series, tenor_months: int) -> _SeasonalFlow:
         clamped.append(max(0.7 * baseline, min(1.3 * baseline, val)))
     forward_expected = sum(clamped) / len(clamped)
 
-    floor_guard_ok = float(series.iloc[-1]) >= C.FLOOR_GUARD_THRESHOLD * ltm
-
-    return _SeasonalFlow(
-        seasonal_eligible=True, ltm_avg=ltm,
-        forward_expected=forward_expected, floor_guard_ok=floor_guard_ok,
-    )
+    return _SeasonalFlow(seasonal_eligible=True, ltm_avg=ltm, forward_expected=forward_expected)
 
 
 def _oos_expected_flow(monthly: pd.Series) -> float | None:
@@ -204,24 +195,25 @@ class _Stream:
     channel_id: str
     channel_type: str
     currency: str
-    payouts: list[Payout]
+    df: pd.DataFrame
     routing_confirmation: float
 
 
 def _streams(req: MerchantLimitRequest) -> list[_Stream]:
-    """Split each channel's multi-currency daily payouts into one stream per currency."""
+    """Split each channel's payouts into one stream per currency via groupby."""
     out: list[_Stream] = []
     for ch in req.channels:
-        for ccy in sorted({p.currency for p in ch.payouts}):
-            out.append(
-                _Stream(
-                    channel_id=ch.channel_id,
-                    channel_type=ch.channel_type,
-                    currency=ccy,
-                    payouts=[p for p in ch.payouts if p.currency == ccy],
-                    routing_confirmation=ch.routing_confirmation,
-                )
-            )
+        full_df = _payouts_df(ch.payouts)
+        if full_df.empty:
+            continue
+        for ccy, sub in full_df.groupby("currency"):
+            out.append(_Stream(
+                channel_id=ch.channel_id,
+                channel_type=ch.channel_type,
+                currency=str(ccy),
+                df=sub.reset_index(drop=True),
+                routing_confirmation=ch.routing_confirmation,
+            ))
     return out
 
 
@@ -298,7 +290,7 @@ def _capture_score(streams: list[_Stream], req: MerchantLimitRequest, as_of: dat
     capture_window_start = as_of - timedelta(days=365)
     routed_annual = 0.0
     for s in streams:
-        window = _routed_daily(s.payouts, as_of)
+        window = _routed_daily(s.df, as_of)
         window = window[window["date"] > capture_window_start]
         if window.empty:
             continue
@@ -321,29 +313,40 @@ def _compute_stream(
     jurisdiction: float, merchant_multiplier: float,
     prev_channel_display: float | None, glide_delta: float,
 ) -> ChannelTrace:
-    weighted = _weighted_daily(s.payouts, as_of)
-    routed = _routed_daily(s.payouts, as_of)
+    weighted = _weighted_daily(s.df, as_of)
+    routed = _routed_daily(s.df, as_of)
 
     trailing_flow = _trailing_flow(weighted, as_of)
 
     # routed share over the trailing window (full value, unweighted) — transparency only
     win_lo = as_of - timedelta(days=C.TRAILING_WINDOW_DAYS)
-    win = _payouts_df(s.payouts)
-    win = win[(win["date"] > win_lo) & (win["date"] <= as_of) & ~win["encumbered"]]
+    win = s.df[(s.df["date"] > win_lo) & (s.df["date"] <= as_of) & ~s.df["encumbered"]]
     win_total = win["amount"].sum()
     win_routed = win[win["routed_to_treyd"]]["amount"].sum()
     routed_share = win_routed / win_total if win_total > 0 else 0.0
 
     monthly = _monthly_from_daily(weighted, as_of)
 
-    if req.expected_flow_eligible:
-        sf = _seasonal_flow(monthly, req.tenor_months)
-    else:
-        sf = _SeasonalFlow(seasonal_eligible=False, ltm_avg=None, forward_expected=None, floor_guard_ok=True)
+    # OOS expected for last month — used by both the floor guard and flow_score.
+    routed_months = pd.to_datetime(routed["date"]).dt.to_period("M").nunique() if not routed.empty else 0
+    oos_expected: float | None = _oos_expected_flow(monthly) if not monthly.empty else None
+
+    sf = (
+        _seasonal_flow(monthly, req.tenor_months)        if len(monthly) >= C.MIN_MONTHS_SEASONAL and routed_months > 1
+        else _SeasonalFlow(seasonal_eligible=False, ltm_avg=None, forward_expected=None)
+    )
+
+    # Floor guard: actual last month must be ≥ 70% of OOS expected (or LTM avg if OOS unavailable).
+    # Uses the per-month expectation so a peak-month shortfall is caught correctly.
+    guard_denominator = oos_expected if oos_expected is not None else sf.ltm_avg
+    floor_guard_ok = (
+        float(monthly.iloc[-1]) >= C.FLOOR_GUARD_THRESHOLD * guard_denominator
+        if (guard_denominator and not monthly.empty) else True
+    )
 
     floor_active = False
     flow_base = trailing_flow
-    if sf.seasonal_eligible and sf.floor_guard_ok and sf.forward_expected is not None:
+    if sf.seasonal_eligible and floor_guard_ok and sf.forward_expected is not None:
         floor_candidate = C.SEASONAL_FLOOR_GAMMA * sf.forward_expected
         if floor_candidate > trailing_flow:
             flow_base = floor_candidate
@@ -351,12 +354,9 @@ def _compute_stream(
 
     # Flow_Score — inert until ≥2 routed months; then actual vs OOS expected (§4.4).
     # Fallback when model can't run: compare month-1 against month-2 (same scale, no lookahead).
-    routed_months = pd.to_datetime(routed["date"]).dt.to_period("M").nunique() if not routed.empty else 0
-    oos_expected: float | None = None
     flow_score = 1.0
     if routed_months >= C.FLOW_SCORE_MIN_ROUTED_MONTHS and not monthly.empty:
         last_month_actual = float(monthly.iloc[-1])
-        oos_expected = _oos_expected_flow(monthly)
         denominator = oos_expected if oos_expected is not None else (float(monthly.iloc[-2]) if len(monthly) >= 2 else None)
         if denominator is not None and denominator > 0:
             flow_score = min(1.0, max(C.FLOW_SCORE_FLOOR, last_month_actual / denominator))
@@ -383,7 +383,7 @@ def _compute_stream(
         expected_flow_last_month=round(oos_expected, 2) if oos_expected is not None else None,
         forward_expected_flow=round(sf.forward_expected, 2) if sf.forward_expected is not None else None,
         seasonal_floor_active=floor_active,
-        floor_guard_ok=sf.floor_guard_ok,
+        floor_guard_ok=floor_guard_ok,
         flow_base=round(flow_base, 2),
         verification_norm=round(v_norm, 6),
         legal_security_norm=round(ls_norm, 6),
@@ -406,7 +406,7 @@ def compute_limit(req: MerchantLimitRequest, as_of: date) -> MerchantLimitRespon
     jurisdiction = _jurisdiction(req.country)
     streams = _streams(req)
 
-    verified_api_months = max((_distinct_months(s.payouts, as_of) for s in streams), default=0)
+    verified_api_months = max((_distinct_months(s.df, as_of) for s in streams), default=0)
     base_months, effective_tenure = _base_months(req.routing_days, verified_api_months)
     override_used = req.base_months_override is not None
     if override_used:

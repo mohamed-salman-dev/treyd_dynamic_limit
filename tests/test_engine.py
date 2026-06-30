@@ -6,7 +6,6 @@ import pandas as pd
 import pytest
 
 from app.engine import (
-    _add_months,
     _base_months,
     _capture_score,
     _jurisdiction,
@@ -14,13 +13,13 @@ from app.engine import (
     _map_pbs,
     _map_rating,
     _monthly_from_daily,
-    _seasonal_index,
+    _payouts_df,
     _streams,
     _weighted_daily,
     compute_limit,
 )
 from app.models import ChannelInput
-from tests.conftest import d, flat_daily, limit_for, m1, make_request, seasonal_daily
+from tests.conftest import d, flat_daily, limit_for, make_request, seasonal_daily
 
 
 # ── Legal security ────────────────────────────────────────────────────────────────────────
@@ -85,47 +84,32 @@ def test_base_months_override_only_above_four():
     assert base == 4.0 and override_base == 5.0
 
 
-# ── Seasonal index (synthetic daily → monthly) ──────────────────────────────────────────────────
-def test_seasonal_index_normalized_and_shaped():
-    payouts = seasonal_daily("2024-01", 24, monthly_base=40_000)
-    monthly = _monthly_from_daily(_weighted_daily(payouts, d("2025-12-31")), d("2025-12-31"))
-    sindex = _seasonal_index(monthly)
-    assert sindex is not None
-    assert sum(sindex.values()) / 12 == pytest.approx(1.0, abs=1e-9)
-    assert sindex[12] > 1.5 and sindex[8] < 0.7
-
-
-def test_thin_history_has_no_seasonal():
-    monthly = pd.Series({pd.Period(_add_months(m1("2026-01"), i), "M"): 1000.0 for i in range(5)})
-    assert _seasonal_index(monthly) is None
-
-
 # ── Flow base / seasonal floor (synthetic daily) ─────────────────────────────────────────────────
 def test_floor_binds_entering_peak():
-    payouts = seasonal_daily("2024-01", 21, monthly_base=40_000)  # ends 2025-09
+    payouts = seasonal_daily("2024-01", 21, monthly_base=40_000, routed=True)  # ends 2025-09
     chans = [ChannelInput(channel_id="shopify", channel_type="shopify_payments", payouts=payouts)]
-    resp = compute_limit(make_request(chans, country="gb", expected_flow_eligible=True), d("2025-09-30"))
+    resp = compute_limit(make_request(chans, country="gb"), d("2025-09-30"))
     ch = limit_for(resp, "GBP").channels[0]
     assert ch.seasonal_floor_active is True
     assert ch.flow_base > ch.trailing_flow
 
 
 def test_trailing_wins_post_peak():
-    payouts = seasonal_daily("2024-01", 24, monthly_base=40_000)  # ends 2025-12
+    payouts = seasonal_daily("2024-01", 24, monthly_base=40_000, routed=True)  # ends 2025-12
     chans = [ChannelInput(channel_id="shopify", channel_type="shopify_payments", payouts=payouts)]
-    resp = compute_limit(make_request(chans, country="gb", expected_flow_eligible=True), d("2025-12-31"))
+    resp = compute_limit(make_request(chans, country="gb"), d("2025-12-31"))
     ch = limit_for(resp, "GBP").channels[0]
     assert ch.seasonal_floor_active is False
     assert ch.flow_base == ch.trailing_flow
 
 
 def test_no_lookahead_truncation():
-    payouts = seasonal_daily("2024-01", 24, monthly_base=40_000)
+    payouts = seasonal_daily("2024-01", 24, monthly_base=40_000, routed=True)
     early = [p for p in payouts if p.date <= d("2025-09-30")]
     full_ch = [ChannelInput(channel_id="s", channel_type="shopify_payments", payouts=payouts)]
     early_ch = [ChannelInput(channel_id="s", channel_type="shopify_payments", payouts=early)]
-    a = compute_limit(make_request(full_ch, country="gb", expected_flow_eligible=True), d("2025-09-30"))
-    b = compute_limit(make_request(early_ch, country="gb", expected_flow_eligible=True), d("2025-09-30"))
+    a = compute_limit(make_request(full_ch, country="gb"), d("2025-09-30"))
+    b = compute_limit(make_request(early_ch, country="gb"), d("2025-09-30"))
     assert limit_for(a, "GBP").dynamic_limit == limit_for(b, "GBP").dynamic_limit
 
 

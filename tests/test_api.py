@@ -65,13 +65,13 @@ def test_unknown_channel_type_is_422():
     assert client.post("/v1/dynamic-limit", json=bad).status_code == 422
 
 
-def test_missing_fx_rate_falls_back_to_capture_06():
+def test_missing_fx_rate_falls_back_to_capture_floor():
     p = _payload(revenue_currency="GBP", total_revenue_ltm=1_000_000)
-    # routed SEK flow but no fx_rates for SEK -> GBP: capture falls back to 0.6, no error
+    # routed SEK flow but no fx_rates for SEK -> GBP: capture falls back to floor (0.5), no error
     p["channels"][0]["payouts"] = _daily("2025-11", 2, 100_000, currency="SEK", routed=True)
     r = client.post("/v1/dynamic-limit", json=p)
     assert r.status_code == 200
-    assert r.json()["merchant_trace"]["capture_score"] == 0.6
+    assert r.json()["merchant_trace"]["capture_score"] == 0.5
 
 
 def test_as_of_defaults_to_today_when_omitted():
