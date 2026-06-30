@@ -48,13 +48,13 @@ def _payouts_df(payouts: list[Payout]) -> pd.DataFrame:
     ])
 
 
-def _weighted_daily(df: pd.DataFrame, as_of: date) -> pd.DataFrame:
+def _weighted_daily(df: pd.DataFrame, as_of: date, provisional_weight: float = C.PROVISIONAL_WEIGHT) -> pd.DataFrame:
     """Daily weighted free amounts up to as_of. Returns DataFrame[date, amount].
-    Routed → full weight, provisional → discounted; encumbered excluded."""
+    Routed → full weight, provisional → provisional_weight; encumbered excluded."""
     if df.empty:
         return pd.DataFrame(columns=["date", "amount"])
     df = df[(df["date"] <= as_of) & ~df["encumbered"]].copy()
-    df["amount"] = df["amount"] * df["routed_to_treyd"].map({True: C.ROUTED_WEIGHT, False: C.PROVISIONAL_WEIGHT})
+    df["amount"] = df["amount"] * df["routed_to_treyd"].map({True: C.ROUTED_WEIGHT, False: provisional_weight})
     return df.groupby("date", as_index=False)["amount"].sum()
 
 
@@ -313,9 +313,16 @@ def _compute_stream(
     jurisdiction: float, merchant_multiplier: float,
     prev_channel_display: float | None, glide_delta: float,
 ) -> ChannelTrace:
-    weighted = _weighted_daily(s.df, as_of)
     routed = _routed_daily(s.df, as_of)
+    routed_months = pd.to_datetime(routed["date"]).dt.to_period("M").nunique() if not routed.empty else 0
 
+    # Non-routed payouts are excluded once routing fills the full trailing window.
+    prov_weight = (
+        C.PROVISIONAL_WEIGHT_POST_OBSERVATION
+        if routed_months >= len(C.TRAILING_WEIGHTS)
+        else C.PROVISIONAL_WEIGHT
+    )
+    weighted = _weighted_daily(s.df, as_of, prov_weight)
     trailing_flow = _trailing_flow(weighted, as_of)
 
     # routed share over the trailing window (full value, unweighted) — transparency only
@@ -328,7 +335,6 @@ def _compute_stream(
     monthly = _monthly_from_daily(weighted, as_of)
 
     # OOS expected for last month — used by both the floor guard and flow_score.
-    routed_months = pd.to_datetime(routed["date"]).dt.to_period("M").nunique() if not routed.empty else 0
     oos_expected: float | None = _oos_expected_flow(monthly) if not monthly.empty else None
 
     sf = (

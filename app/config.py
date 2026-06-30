@@ -65,7 +65,8 @@ CAPTURE_FALLBACK_NO_FX = 0.50   # used when a routed currency lacks an FX rate t
 # Each payout is weighted by whether it routed to Treyd. The provisional (non-routed) weight is
 # the routing discount baked into flow; the blend ramps to full weight as recent days route.
 ROUTED_WEIGHT = 1.0
-PROVISIONAL_WEIGHT = 0.7              # non-routed (pre-Treyd) settlements — discounted
+PROVISIONAL_WEIGHT = 0.7              # non-routed during observation period — discounted stand-in
+PROVISIONAL_WEIGHT_POST_OBSERVATION = 0.0  # excluded once routing fills the full trailing window
 
 # ── Trailing window (daily) ──────────────────────────────────────────────────────────────────
 TRAILING_WINDOW_DAYS = 90            # flow window measured back from as_of_date
