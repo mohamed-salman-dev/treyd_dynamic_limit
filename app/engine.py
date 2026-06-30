@@ -352,11 +352,12 @@ def _compute_stream(
     # Flow_Score — inert until ≥2 routed months; then actual vs OOS expected (§4.4).
     # Fallback when model can't run: compare month-1 against month-2 (same scale, no lookahead).
     routed_months = pd.to_datetime(routed["date"]).dt.to_period("M").nunique() if not routed.empty else 0
+    oos_expected: float | None = None
     flow_score = 1.0
     if routed_months >= C.FLOW_SCORE_MIN_ROUTED_MONTHS and not monthly.empty:
         last_month_actual = float(monthly.iloc[-1])
-        oos = _oos_expected_flow(monthly)
-        denominator = oos if oos is not None else (float(monthly.iloc[-2]) if len(monthly) >= 2 else None)
+        oos_expected = _oos_expected_flow(monthly)
+        denominator = oos_expected if oos_expected is not None else (float(monthly.iloc[-2]) if len(monthly) >= 2 else None)
         if denominator is not None and denominator > 0:
             flow_score = min(1.0, max(C.FLOW_SCORE_FLOOR, last_month_actual / denominator))
 
@@ -379,7 +380,7 @@ def _compute_stream(
         routed_share=round(routed_share, 6),
         seasonal_eligible=sf.seasonal_eligible,
         ltm_avg=round(sf.ltm_avg, 2) if sf.ltm_avg is not None else None,
-        expected_flow_last_month=None,
+        expected_flow_last_month=round(oos_expected, 2) if oos_expected is not None else None,
         forward_expected_flow=round(sf.forward_expected, 2) if sf.forward_expected is not None else None,
         seasonal_floor_active=floor_active,
         floor_guard_ok=sf.floor_guard_ok,
